@@ -90,7 +90,18 @@ const char* WIFI_PASS = "12345678";
 static const uint8_t ROUTE_MAX_STEPS = 50;
 static const char*  NVS_NS          = "galva";
 
-static const int MAX_BATHS = 10;     // количество ванн
+// ----------- NVS STORAGE FOR BATH TAGS ---------------
+// Ключи в NVS
+static const char* NVS_KEY_BATH_COUNT = "bath_cnt";
+static const char* NVS_KEY_BATH_TAGS  = "bath_tags";
+
+// --- ДИНАМИЧЕСКОЕ КОЛИЧЕСТВО ВАНН ---
+
+static const int MIN_BATHS = 5;          // минимальное количество ванн
+static const int MAX_BATHS_LIMIT = 20;   // максимальный возможный предел
+
+int dynamicBathCount = MIN_BATHS;        // текущее количество ванн
+
 static const int HIST_LEN  = 120;    // длина истории (120 точек = 6 мин при шаге ~3 сек)
 
 // Структура записи истории ванны (температура, pH, ORP, ток)
@@ -101,9 +112,22 @@ struct BathHistRec {
     float current;
 };
 
-// История по ваннам
-BathHistRec hist[MAX_BATHS][HIST_LEN];
-uint16_t    histPtr[MAX_BATHS] = {0};
+// История ванн
+BathHistRec hist[MAX_BATHS_LIMIT][HIST_LEN];
+uint16_t    histPtr[MAX_BATHS_LIMIT] = {0};
+
+// Описание одной ванны с RFID
+struct BathInfo {
+    uint16_t bathNumber;   // логический номер ванны (для маршрутов)
+    uint8_t  uidLen;       // длина UID
+    uint8_t  uid[7];       // сам UID (до 7 байт)
+    bool     isStart;      // флаг "начальная ванна"
+    bool     isEnd;        // флаг "конечная ванна"
+};
+
+// Динамический список ванн
+std::vector<BathInfo> g_baths;
+
 
 // слоты шаблонов
 static const uint8_t ROUTE_SLOTS = 5;
@@ -156,6 +180,8 @@ Preferences prefs;
 Step     g_route[ROUTE_MAX_STEPS];
 uint16_t g_routeSteps = 0;
 
+bool oledReady = false;
+
 // Состояние процесса
 volatile ProcState g_state       = PS_IDLE;
 volatile int16_t   g_stepIdx     = -1;
@@ -168,17 +194,13 @@ volatile bool g_stopCommand  = false;
 
 // Позиция моста по X (номер ванны 0..MAX_BATHS-1)
 volatile int16_t bathIndex = 0;
+
 // Направление движения по X (true = вправо, false = влево)
 volatile bool    dirRight  = true;
 
 
-// ---------------- PN532 NFC ----------------
 // Используем только I2C (SDA=21, SCL=22), IRQ/RESET НЕ НУЖНЫ ДЛЯ I2C
-
 Adafruit_PN532 nfc(PN532_IRQ, PN532_RESET, &Wire);
-
-
-// Адрес PN532 — автоопределяется внутри begin()
 
 
 
@@ -189,45 +211,175 @@ volatile bool    g_inSelectMenu  = false;
 // Энкодер
 volatile int g_encDelta = 0;
 
-// ---------------- PN532 NFC ----------------
 
-// Адрес PN532 в I2C (чаще всего 0x24 или 0x48; начни с 0x24, если не заработает — поменяешь)
+// ------------------------------------------------------
+//    SAVE/LOAD g_baths (BathInfo) и dynamicBathCount в NVS
+// ------------------------------------------------------
 
-
-// Таблица UID меток по ваннам
-// Сначала оставим заглушки, потом заполнишь реальными UID
-// MAX_BATHS у тебя = 10, поэтому делаем 10 записей
-uint8_t bathTags[MAX_BATHS][7] = {
-    // ванна 0
-    { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
-    // ванна 1
-    { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
-    // ванна 2
-    { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
-    // ванна 3
-    { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
-    // ванна 4
-    { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
-    // ванна 5
-    { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
-    // ванна 6
-    { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
-    // ванна 7
-    { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
-    // ванна 8
-    { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
-    // ванна 9
-    { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+// Структура для сохранения в NVS
+struct BathRecordNVS {
+    uint16_t bathNumber;
+    uint8_t  uidLen;
+    uint8_t  uid[7];
+    uint8_t  flags;   // bit0 = isStart, bit1 = isEnd
 };
 
-// Длина UID для каждой ванны (пока нули, потом заполнишь)
-uint8_t bathTagLen[MAX_BATHS] = {0};
+// Сохранение bathList в NVS
+void saveBathListToNVS() {
+    prefs.begin(NVS_NS, false);
+
+    // обновим dynamicBathCount
+    dynamicBathCount = (int)g_baths.size();
+    if (dynamicBathCount > MAX_BATHS_LIMIT) {
+        dynamicBathCount = MAX_BATHS_LIMIT;
+    }
+
+    // сохраняем количество ванн
+    prefs.putUShort(NVS_KEY_BATH_COUNT, (uint16_t)dynamicBathCount);
+
+    if (dynamicBathCount == 0) {
+        prefs.end();
+        Serial.println("[NVS] Saved 0 baths");
+        return;
+    }
+
+    BathRecordNVS records[MAX_BATHS_LIMIT];
+
+    for (int i = 0; i < dynamicBathCount; ++i) {
+        const BathInfo &b = g_baths[i];
+        records[i].bathNumber = b.bathNumber;
+        records[i].uidLen     = b.uidLen;
+
+        memset(records[i].uid, 0, sizeof(records[i].uid));
+        if (b.uidLen > 0 && b.uidLen <= 7) {
+            memcpy(records[i].uid, b.uid, b.uidLen);
+        }
+
+        uint8_t f = 0;
+        if (b.isStart) f |= 0x01;
+        if (b.isEnd)   f |= 0x02;
+        records[i].flags = f;
+    }
+
+    prefs.putBytes(NVS_KEY_BATH_TAGS,
+                   records,
+                   sizeof(BathRecordNVS) * dynamicBathCount);
+
+    prefs.end();
+
+    Serial.printf("[NVS] Saved %d baths\n", dynamicBathCount);
+}
+
+// Загрузка bathList из NVS
+void loadBathListFromNVS() {
+    prefs.begin(NVS_NS, true);
+
+    uint16_t cnt = prefs.getUShort(NVS_KEY_BATH_COUNT, 0);
+
+    if (cnt == 0 || cnt > MAX_BATHS_LIMIT) {
+        prefs.end();
+        Serial.println("[NVS] No bath list saved (or invalid count)");
+        g_baths.clear();
+        dynamicBathCount = 0;
+        return;
+    }
+
+    size_t need = sizeof(BathRecordNVS) * cnt;
+    size_t have = prefs.getBytesLength(NVS_KEY_BATH_TAGS);
+
+    if (have < need) {
+        prefs.end();
+        Serial.println("[NVS] bath_list corrupted or incomplete");
+        g_baths.clear();
+        dynamicBathCount = 0;
+        return;
+    }
+
+    BathRecordNVS records[MAX_BATHS_LIMIT];
+    prefs.getBytes(NVS_KEY_BATH_TAGS, records, need);
+    prefs.end();
+
+    g_baths.clear();
+    g_baths.reserve(cnt);
+
+    for (int i = 0; i < cnt; ++i) {
+        BathInfo b;
+        b.bathNumber = records[i].bathNumber;
+        b.uidLen     = records[i].uidLen;
+
+        if (b.uidLen > 7) b.uidLen = 7;
+        memset(b.uid, 0, sizeof(b.uid));
+        if (b.uidLen > 0) {
+            memcpy(b.uid, records[i].uid, b.uidLen);
+        }
+
+        b.isStart = records[i].flags & 0x01;
+        b.isEnd   = records[i].flags & 0x02;
+
+        g_baths.push_back(b);
+    }
+
+    dynamicBathCount = (int)g_baths.size();
+
+    Serial.printf("[NVS] Loaded %d baths\n", dynamicBathCount);
+
+    
+}
+
+// ------------------------------------------------------
+//   ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ РАБОТЫ С ДИНАМИЧЕСКИМ СПИСКОМ ВАНН
+// ------------------------------------------------------
+
+// Поиск индекса ванны по UID (возвращает -1, если не нашли)
+int findBathIndexByUID(const uint8_t uid[], uint8_t uidLen) {
+    if (uidLen == 0 || uidLen > 7) return -1;
+
+    for (int i = 0; i < (int)g_baths.size(); ++i) {
+        const BathInfo &b = g_baths[i];
+        if (b.uidLen != uidLen) continue;
+
+        bool same = true;
+        for (uint8_t j = 0; j < uidLen; ++j)
+            if (b.uid[j] != uid[j]) { same = false; break; }
+
+        if (same) return i;
+    }
+    return -1;
+}
+
+// Добавить новую ванну или обновить существующую
+void addOrUpdateBathByUID(const uint8_t uid[], uint8_t uidLen) {
+    int idx = findBathIndexByUID(uid, uidLen);
+
+    if (idx >= 0) {
+        BathInfo &b = g_baths[idx];
+        b.uidLen = uidLen;
+        memcpy(b.uid, uid, uidLen);
+        saveBathListToNVS();
+        return;
+    }
+
+    if ((int)g_baths.size() >= MAX_BATHS_LIMIT) return;
+
+    BathInfo b{};
+    b.bathNumber = (uint16_t)g_baths.size();
+    b.uidLen = uidLen;
+    memcpy(b.uid, uid, uidLen);
+
+    g_baths.push_back(b);
+    dynamicBathCount = g_baths.size();
+    saveBathListToNVS();
+}
+
 
 
 
 // ---------------- ПРОТОТИП ФУНКЦИИ СМЕНЫ СОСТОЯНИЯ ----------------
 
 void setState(ProcState newState, const char* reason);
+
+// Прототип функции привязки RFID-метки к новой ванне
+void assignNewBathTag(uint8_t uid[], uint8_t uidLen);
 
 // ---------------- БИБЛИОТЕКА РЕЦЕПТОВ В NVS ----------------
 // Индекс: ключ "routes" (строка CSV вида "1,2,5")
@@ -492,13 +644,12 @@ String rtcDateString() {
     return String(buf);
 }
 
-
 // ---------------- PN532 INIT ----------------
 
 void nfcInit() {
     DBG_PRINTLN(F("[PN532] init start"));
 
-    Wire.begin(I2C_SDA, I2C_SCL);
+    //Wire.begin(I2C_SDA, I2C_SCL);
 
     nfc.begin();
 
@@ -520,51 +671,55 @@ void nfcInit() {
     DBG_PRINTLN(F("[PN532] init done"));
 }
 
-
 // Чтение RFID-метки.
 // Возвращает true, если метка найдена и сопоставлена с какой-то ванной.
-// detectedBath — номер ванны 0..MAX_BATHS-1
+// detectedBath — индекс ванны (0..dynamicBathCount-1)
 bool readTag(int &detectedBath)
 {
     uint8_t uid[7] = {0};
     uint8_t uidLength = 0;
 
-    // Пытаемся прочитать метку MIFARE/ISO14443A
     bool success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A,
                                            uid, &uidLength);
-    if (!success) {
-        return false; // ничего нет в поле
-    }
+    if (!success) return false;
 
+    // выводим UID
     DBG_PRINT("[PN532] UID = ");
     for (uint8_t i = 0; i < uidLength; i++) {
         DBG_PRINTF("%02X ", uid[i]);
     }
     DBG_PRINTLN("");
 
-    // Сопоставляем UID с таблицей ванн
-    for (int b = 0; b < MAX_BATHS; b++) {
-        if (bathTagLen[b] == uidLength && uidLength != 0) {
-            bool same = true;
-            for (uint8_t i = 0; i < uidLength; i++) {
-                if (bathTags[b][i] != uid[i]) {
-                    same = false;
-                    break;
-                }
-            }
-            if (same) {
-                detectedBath = b;
-                DBG_PRINTF("[PN532] matched bathIndex=%d\r\n", b);
-                return true;
-            }
-        }
+    // регистрируем новую ванну, если её ещё не было
+    assignNewBathTag(uid, uidLength);
+
+    // ищем индекс ванны по UID
+    int idx = findBathIndexByUID(uid, uidLength);
+    if (idx >= 0) {
+        detectedBath = idx;
+        return true;
     }
 
-    // UID не находится в таблице
     return false;
+    Serial.println("DEBUG: nfcInit() finished!");
+
 }
 
+// Привязать RFID-метку к ванне (динамический список g_baths)
+void assignNewBathTag(uint8_t uid[], uint8_t uidLen) {
+    if (uidLen == 0 || uidLen > 7) return;
 
+    // пробуем найти по UID — если есть, просто ничего не делаем
+    int idx = findBathIndexByUID(uid, uidLen);
+    if (idx >= 0) {
+        Serial.printf("[BATH] UID already assigned to bath index=%d, bathNumber=%u\n",
+                      idx, g_baths[idx].bathNumber);
+        return;
+    }
+
+    // иначе добавляем новую ванну
+    addOrUpdateBathByUID(uid, uidLen);
+}
 
 void nfcTestLoop() {
     int bath = -1;
@@ -613,46 +768,54 @@ void nfcTestLoop() {
 
 // ---------------- OLED ----------------
 
-
 void oledInit() {
     DBG_PRINTLN(F("[OLED] init start"));
+
+    // проверяем шину I2C
     Wire.begin(I2C_SDA, I2C_SCL);
-    if (!oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-        DBG_PRINTLN(F("[OLED] init failed"));
-        Serial.println(F("OLED init failed"));
-        for (;;) { delay(1000); }
+    Wire.setClock(400000);
+
+    // тест: пин сканер
+    Wire.beginTransmission(OLED_ADDR);
+    if (Wire.endTransmission() != 0) {
+        Serial.println("[OLED] NOT FOUND at 0x3C");
+        return;
     }
 
-    u8g2.begin(oled);
-    u8g2.setFont(u8g2_font_6x13_t_cyrillic);
+    // запускаем SSD1306
+    if (!oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+        Serial.println("[OLED] begin() FAIL");
+        return;
+    }
 
     oled.clearDisplay();
     oled.setTextColor(SSD1306_WHITE);
     oled.setTextSize(1);
-    oled.setCursor(0,0);
-    oled.println(F("GalvaControl"));
+    oled.setCursor(0, 0);
+    oled.println(F("OLED OK"));
     oled.display();
-    DBG_PRINTLN(F("[OLED] init done"));
+
+    oledReady = true;
+    Serial.println("[OLED] init done");
 }
 
-// void oledInit() {
-//     DBG_PRINTLN(F("[OLED] init start"));
-//     Wire.begin(I2C_SDA, I2C_SCL);
-//     if (!oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-//         DBG_PRINTLN(F("[OLED] init failed"));
-//         Serial.println(F("OLED init failed"));
-//         u8g2.begin(oled);
-// u8g2.setFont(u8g2_font_6x13_t_cyrillic);  
-//         for (;;) { delay(1000); }
-//     }
-//     oled.clearDisplay();
-//     oled.setTextColor(SSD1306_WHITE);
-//     oled.setTextSize(1);
-//     oled.setCursor(0,0);
-//     oled.println(F("GalvaControl"));
-//     oled.display();
-//     DBG_PRINTLN(F("[OLED] init done"));
-// }
+void initBathTables() {
+    // сброс истории ванн
+    for (int b = 0; b < MAX_BATHS_LIMIT; ++b) {
+        histPtr[b] = 0;
+        for (int i = 0; i < HIST_LEN; ++i) {
+            hist[b][i].temp    = 0;
+            hist[b][i].ph      = 0;
+            hist[b][i].orp     = 0;
+            hist[b][i].current = 0;
+        }
+    }
+
+    // сбрасываем список ванн
+    g_baths.clear();
+    dynamicBathCount = 0;
+}
+
 
 void oledShowIdle() {
     DBG_PRINTLN(F("[OLED] show IDLE screen"));
@@ -751,8 +914,6 @@ void zDownRelay(bool en) {
     digitalWrite(REL_Z_DOWN, en ? ON : OFF);
 }
 
-
-
 // ---------------- ЭНКОДЕР + КНОПКА ----------------
 void IRAM_ATTR encISR() {
     bool a = digitalRead(ENC_A);
@@ -792,67 +953,45 @@ bool startButtonPressed() {
 
 bool moveToBath(int targetBath, uint32_t timeoutMs)
 {
-    DBG_PRINTF("[MOVE_X] moveToBath: target=%d, current=%d, timeout=%u ms\r\n",
-               targetBath, (int)bathIndex, (unsigned)timeoutMs);
+    DBG_PRINTF("[MOVE_X] moveToBath target=%d current=%d\n",
+               targetBath, bathIndex);
 
     uint32_t t0 = millis();
 
-    // Уже стоим на нужной точке
     if (targetBath == bathIndex) {
-        DBG_PRINTLN("[MOVE_X] already at target");
         xFwd(false);
         xRev(false);
         g_currentBath = bathIndex;
         return true;
     }
 
-    // Определяем направление движения
     dirRight = (targetBath > bathIndex);
 
-    if (dirRight) {
-        DBG_PRINTLN("[MOVE_X] direction RIGHT");
-        xRev(false);
-        xFwd(true);
-    } else {
-        DBG_PRINTLN("[MOVE_X] direction LEFT");
-        xFwd(false);
-        xRev(true);
-    }
+    if (dirRight) { xRev(false); xFwd(true); }
+    else          { xFwd(false); xRev(true); }
 
-    // Основной цикл движения
     while (millis() - t0 < timeoutMs)
     {
-        // Проверка RFID
         int detected = -1;
-        if (readTag(detected)) {
-            // Увидели RFID метку
-            DBG_PRINTF("[MOVE_X] RFID detected bath=%d\r\n", detected);
 
+        if (readTag(detected)) {
             bathIndex = detected;
             g_currentBath = detected;
 
             if (detected == targetBath) {
-                DBG_PRINTF("[MOVE_X] reached bath %d OK\r\n", detected);
                 xFwd(false);
                 xRev(false);
                 return true;
             }
         }
 
-        // Проверка аварийной кнопки
-        if (digitalRead(PIN_ESTOP) == LOW) {
-            DBG_PRINTLN("[MOVE_X] ESTOP pressed. STOP movement.");
-            break;
-        }
+        if (digitalRead(PIN_ESTOP) == LOW) break;
 
-        // Очень важно — дать ядру дыхнуть
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
 
-    // Останов после таймаута или аварии
     xFwd(false);
     xRev(false);
-    DBG_PRINTLN("[MOVE_X] timeout — failed to reach target");
     return false;
 }
 
@@ -1243,10 +1382,10 @@ void handleBathHistory() {
     }
     int b = server.arg("bath").toInt();
     DBG_PRINTF("[HTTP]   bath=%d\r\n", b);
-    if(b<0 || b>=MAX_BATHS){
-        server.send(400,"text/plain","invalid bath");
-        return;
-    }
+    if (b < 0 || b >= dynamicBathCount) {
+    server.send(400, "text/plain", "invalid bath");
+    return;
+}
     String out;
     out.reserve(2048);
     out = "[";
@@ -1269,8 +1408,9 @@ void handleBathHistory() {
 
 void handleBathData() {
     DBG_PRINTLN(F("[HTTP] GET /bath_data"));
-    // пример: 10 ванн
-    const int N = 10;
+
+ const int N = dynamicBathCount;
+
 
     String out;
     out.reserve(1024);
@@ -1318,7 +1458,8 @@ void TaskProcess(void* pv) {
         static uint32_t lastHist = 0;
         if (millis() - lastHist > 3000) {
             lastHist = millis();
-            for (int b = 0; b < MAX_BATHS; b++) {
+         for (int b = 0; b < dynamicBathCount; b++)
+ {
                 int p = histPtr[b] = (histPtr[b] + 1) % HIST_LEN;
                 hist[b][p].temp    = 25.0 + b * 0.2;
                 hist[b][p].ph      = 7.00;
@@ -1537,8 +1678,59 @@ void TaskWeb(void* pv) {
 // ---------------- SETUP/LOOP ----------------
 
 void setup() {
+
     Serial.begin(115200);
     delay(300);
+
+    Wire.begin(I2C_SDA, I2C_SCL);  // 1) запускаем шину I2C
+
+    oledInit();    // 2) OLED ОБЯЗАТЕЛЬНО первым
+
+    Serial.println("DEBUG: calling nfcInit()");
+
+    nfcInit();     // 3) потом PN532
+
+    // =============== NFC TEST MODE ===============
+// Если удерживать кнопку START при включении — входим в NFC TEST MODE
+// if (digitalRead(BTN_START) == LOW) {
+//     Serial.println("[TEST] START held -> NFC TEST MODE");
+//     delay(300);
+//     nfcTestLoop();  // <<< запуск теста (БЛОКИРУЮЩИЙ)
+// }
+
+       // Инициализация таблиц
+    initBathTables();          // очистка истории и g_baths (пусто)
+    loadBathListFromNVS();     // загрузка ванн из NVS
+
+    // Если хочешь гарантированный минимум "логических" ванн – можно создать пустые слоты
+    if (dynamicBathCount < MIN_BATHS) {
+        for (int i = dynamicBathCount; i < MIN_BATHS; ++i) {
+            if ((int)g_baths.size() >= MAX_BATHS_LIMIT) break;
+            BathInfo b;
+            b.bathNumber = (uint16_t)i;
+            b.uidLen     = 0;
+            memset(b.uid, 0, sizeof(b.uid));
+            b.isStart = (i == 0);                 // можно сразу пометить нулевую как старт
+            b.isEnd   = false;
+            g_baths.push_back(b);
+        }
+        dynamicBathCount = (int)g_baths.size();
+        saveBathListToNVS();
+    }
+    
+
+    Serial.printf("[SETUP] dynamicBathCount = %d\n", dynamicBathCount);
+
+
+    rtc.Begin();   // потом RTC
+      DBG_PRINTLN(F("[SETUP] RTC init"));
+    if (!rtc.IsDateTimeValid()) {
+        DBG_PRINTLN(F("[SETUP] RTC invalid, set from compile time"));
+        rtc.SetDateTime(RtcDateTime(__DATE__, __TIME__));
+    } else {
+        DBG_PRINTLN(F("[SETUP] RTC time OK"));
+    }
+
     DBG_PRINTLN();
     DBG_PRINTLN(F("===== GalvaControl ESP32 boot ====="));
 
@@ -1564,41 +1756,14 @@ void setup() {
     attachInterrupt(digitalPinToInterrupt(ENC_A),    encISR,  CHANGE);
     DBG_PRINTLN(F("[SETUP] GPIO & interrupts configured"));
 
-        // OLED
-    oledInit();
-
-    // RTC
-    DBG_PRINTLN(F("[SETUP] RTC init"));
-    rtc.Begin();
-    if (!rtc.IsDateTimeValid()) {
-        DBG_PRINTLN(F("[SETUP] RTC invalid, set from compile time"));
-        rtc.SetDateTime(RtcDateTime(__DATE__, __TIME__));
-    } else {
-        DBG_PRINTLN(F("[SETUP] RTC time OK"));
-    }
-
-    // PN532
-    nfcInit();
-
-      // запустить тест NFC
-    nfcTestLoop();
-
-    // int bath;
-    // if (readTag(bath)) {
-    //     // UID уже выводится внутри readTag()
-    // }
-    // delay(500);
-    
+    // запустить тест NFC
+    //nfcTestLoop();
 
     // загрузка активного маршрута id
     prefs.begin("galva", true);
     g_activeRoute = prefs.getShort("active_route", -1);
     prefs.end();
     DBG_PRINTF("[SETUP] activeRoute from NVS: %d\r\n", (int)g_activeRoute);
-
-   
-
-
 
     // Инициализация слотов шаблонов: создадим тестовый в слоте 0, если пусто
     DBG_PRINTLN(F("[SETUP] Load slot 0"));
