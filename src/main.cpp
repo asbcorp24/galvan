@@ -21,8 +21,11 @@
 #include "web_ui.h"
 #include "web_monitor.h"
 #include "web_routes.h"
+#include "web_baths.h"
+#include "web_autolearn.h"
 #include <U8g2_for_Adafruit_GFX.h>
 #include <Adafruit_PN532.h>
+#include "web_layout.h"
 // ---------------- DEBUG МАКРОСЫ ----------------
 
 // Включение/выключение глобального debug-лога
@@ -86,9 +89,10 @@
 int16_t g_activeRoute = -1;   // -1 = не выбран
 const char* WIFI_SSID = "GalvaControl";
 const char* WIFI_PASS = "12345678";
-
+volatile int16_t shadowBath = 0;  // промежуточный ожидаемый номер ванны
 static const uint8_t ROUTE_MAX_STEPS = 50;
 static const char*  NVS_NS          = "galva";
+volatile int16_t g_targetBath = -1;
 
 // ----------- NVS STORAGE FOR BATH TAGS ---------------
 // Ключи в NVS
@@ -158,7 +162,8 @@ enum ProcState : uint8_t {
     PS_DRY,
     PS_NEXT_STEP,
     PS_RETURN_HOME,
-    PS_ERROR
+    PS_ERROR,
+    PS_LEARN_BATHS 
 };
 
 // ---------------- ГЛОБАЛЬНЫЕ ----------------
@@ -223,7 +228,17 @@ struct BathRecordNVS {
     uint8_t  uid[7];
     uint8_t  flags;   // bit0 = isStart, bit1 = isEnd
 };
-
+// Преобразовать UID в hex-строку без пробелов
+String uidToHexString(const uint8_t *uid, uint8_t len) {
+    String s;
+    s.reserve(len * 2);
+    for (uint8_t i = 0; i < len; ++i) {
+        if (uid[i] < 16) s += "0";
+        s += String(uid[i], HEX);
+    }
+    s.toUpperCase();
+    return s;
+}
 // Сохранение bathList в NVS
 void saveBathListToNVS() {
     prefs.begin(NVS_NS, false);
@@ -704,7 +719,12 @@ bool readTag(int &detectedBath)
     Serial.println("DEBUG: nfcInit() finished!");
 
 }
-
+// ------------------ RFID helper ------------------
+bool uidEquals(const uint8_t* a, const uint8_t* b, uint8_t len) {
+    for (uint8_t i = 0; i < len; i++)
+        if (a[i] != b[i]) return false;
+    return true;
+}
 // Привязать RFID-метку к ванне (динамический список g_baths)
 void assignNewBathTag(uint8_t uid[], uint8_t uidLen) {
     if (uidLen == 0 || uidLen > 7) return;
@@ -767,6 +787,33 @@ void nfcTestLoop() {
 }
 
 // ---------------- OLED ----------------
+void oledShowLearn(int foundCount, uint8_t* uid, uint8_t uidLen) {
+    oled.clearDisplay();
+    u8g2.setFont(u8g2_font_6x12_t_cyrillic);
+
+    u8g2.setCursor(0, 10);
+    u8g2.print("ОБУЧЕНИЕ ВАНН");
+
+    u8g2.setCursor(0, 25);
+    u8g2.print("Найдено: ");
+    u8g2.print(foundCount);
+
+    u8g2.setCursor(0, 40);
+    u8g2.print("UID: ");
+    for (int i = 0; i < uidLen; i++) {
+        if (uid[i] < 16) u8g2.print("0");
+        u8g2.print(uid[i], HEX);
+        u8g2.print(" ");
+    }
+
+    // анимация движения →
+    static int pos = 0;
+    const char* anim = "=>     ";
+    u8g2.setCursor(0, 58);
+    u8g2.print(anim + (pos++ % 3));
+
+    oled.display();
+}
 
 void oledInit() {
     DBG_PRINTLN(F("[OLED] init start"));
@@ -787,7 +834,7 @@ void oledInit() {
         Serial.println("[OLED] begin() FAIL");
         return;
     }
-
+    u8g2.begin(oled);
     oled.clearDisplay();
     oled.setTextColor(SSD1306_WHITE);
     oled.setTextSize(1);
@@ -818,22 +865,32 @@ void initBathTables() {
 
 
 void oledShowIdle() {
-    DBG_PRINTLN(F("[OLED] show IDLE screen"));
+   // DBG_PRINTLN(F("[OLED] show IDLE screen"));
+    u8g2.setFont(u8g2_font_6x12_t_cyrillic);   // ← РУССКИЙ ШРИФТ
     oled.clearDisplay();
-    oled.setCursor(0,0);
-    oled.println(rtcTimeString());
-    oled.println(rtcDateString());
-    oled.print(F("State: IDLE\nBath: "));
-    oled.println(g_currentBath);
-    oled.print(F("Steps: "));
-    oled.println(g_routeSteps);
-    oled.println(F("START=запуск"));
-    oled.println(F("ENC=выбор шаблона"));
+ u8g2.setCursor(0, 10);
+    u8g2.print(rtcTimeString());
+    u8g2.setCursor(60, 10);
+    u8g2.print(rtcDateString());
+
+    u8g2.setCursor(0, 25);
+    u8g2.print("Состояние: IDLE");
+
+    u8g2.setCursor(0,36);
+    u8g2.print("Ванна: ");
+    u8g2.print(g_currentBath);
+
+    u8g2.setCursor(0, 48);
+    u8g2.print("Шагов: ");
+    u8g2.print(g_routeSteps);
+     u8g2.setCursor(0, 58);
+    u8g2.print(F("START=запуск"));
+    u8g2.print(F("ENC=выбор шаблона"));
     oled.display();
 }
 
 void oledShowRun() {
-    DBG_PRINTF("[OLED] show RUN screen, state=%d, stepIdx=%d\r\n", (int)g_state, (int)g_stepIdx);
+  //  DBG_PRINTF("[OLED] show RUN screen, state=%d, stepIdx=%d\r\n", (int)g_state, (int)g_stepIdx);
     oled.clearDisplay();
     oled.setCursor(0,0);
     oled.println(rtcTimeString());
@@ -858,30 +915,79 @@ void oledShowRun() {
         case PS_ERROR:       oled.println(F("ERROR")); break;
         default:             oled.println(F("RUN")); break;
     }
-
+        oled.print(g_currentBath);
+        oled.print("follow: ");
+        oled.println(g_targetBath >= 0 ? g_targetBath : g_currentBath);
     oled.display();
 }
 
 void oledShowSelectMenu() {
     DBG_PRINTF("[OLED] show select menu, selected=%d\r\n", (int)g_selectedRoute);
-    oled.clearDisplay();
-    oled.setCursor(0,0);
-    oled.println(F("Выбор шаблона"));
-    oled.println(F("----------------"));
 
-    for (int i = 0; i < ROUTE_SLOTS; i++) {
-        if (i == g_selectedRoute) oled.print(F("> "));
-        else                      oled.print(F("  "));
-        oled.print(F("Шаблон "));
-        oled.println(i);
+    oled.clearDisplay();
+    u8g2.setFont(u8g2_font_6x12_t_cyrillic);
+
+    const int lineHeight = 14;
+    const int maxVisible = 3;     // <<< ПОКАЗЫВАЕМ 3 СТРОКИ
+    const int startY = 22;
+
+    // Рамка окна
+    oled.drawRect(0, 0, 128, 64, SSD1306_WHITE);
+
+    // Заголовок
+    oled.setTextColor(SSD1306_WHITE);
+    u8g2.setCursor(10, 12);
+    u8g2.print("Выбор шаблона");
+
+    // --- ПРОКРУТКА ---
+    int total = ROUTE_SLOTS;
+    int first = 0;
+
+    // Смещаем окно так, чтобы выбранный пункт был по центру
+    if (g_selectedRoute > 0) {
+        first = g_selectedRoute - 1;
+        if (first > total - maxVisible)
+            first = total - maxVisible;
+        if (first < 0) first = 0;
     }
+
+    // --- СПИСОК ---
+    for (int i = 0; i < maxVisible; i++) {
+        int idx = first + i;
+        if (idx >= total) break;
+
+        int yText = startY + i * lineHeight;
+
+        bool selected = (idx == g_selectedRoute);
+
+        if (selected) {
+            // Стильная рамка вокруг строки
+            oled.drawRect(
+                4,            // x
+                yText - 11,   // y
+                120,          // width
+                lineHeight,   // height
+                SSD1306_WHITE
+            );
+        }
+
+        // Текст обычный
+        oled.setTextColor(SSD1306_WHITE);
+
+        u8g2.setCursor(8, yText);
+        u8g2.print("Шаблон ");
+        u8g2.print(idx);
+    }
+
     oled.display();
 }
+
+
 
 // ---------------- РЕЛЕ ----------------
 
 void relOffAll() {
-    DBG_PRINTLN(F("[RELAY] OFF ALL"));
+ 
     digitalWrite(REL_X_FWD, OFF);
     digitalWrite(REL_X_REV, OFF);
     digitalWrite(REL_Z_UP, OFF);
@@ -951,7 +1057,7 @@ bool startButtonPressed() {
 // Возвращает true — если дошёл до нужной ванны
 // Возвращает false — если таймаут или авария
 
-bool moveToBath(int targetBath, uint32_t timeoutMs)
+/*bool moveToBath(int targetBath, uint32_t timeoutMs)
 {
     DBG_PRINTF("[MOVE_X] moveToBath target=%d current=%d\n",
                targetBath, bathIndex);
@@ -993,8 +1099,124 @@ bool moveToBath(int targetBath, uint32_t timeoutMs)
     xFwd(false);
     xRev(false);
     return false;
+}*/
+// Улучшенное движение к ванне по RFID
+bool moveToBath(int targetBath, uint32_t timeoutMs)
+{
+    DBG_PRINTF("\n[MOVE_X] >>> moveToBath(target=%d, current=%d)\n",
+               targetBath, bathIndex);
+shadowBath = bathIndex;  // стартуем с текущей подтверждённой ванны
+g_targetBath = targetBath;
+    uint32_t t0 = millis();
+/////
+    if (targetBath == bathIndex) {
+        DBG_PRINTLN("[MOVE_X] Already at target bath");
+        xFwd(false);
+        xRev(false);
+        g_currentBath = bathIndex;
+        return true;
+    }
+
+    // направление
+    dirRight = (targetBath > bathIndex);
+    DBG_PRINTF("[MOVE_X] Direction = %s\n", dirRight ? "RIGHT" : "LEFT");
+
+    if (dirRight) {
+        xRev(false);
+        xFwd(true);
+    } else {
+        xFwd(false);
+        xRev(true);
+    }
+
+    // переменные стабилизации UID
+    uint8_t lastUid[7] = {0};
+    uint8_t lastLen = 0;
+    int stableCount = 0;
+
+    const int STABLE_REQUIRED = 2;  // нужно 2 подряд одинаковых чтения UID
+    uint8_t uid[7];
+    uint8_t uidLen;
+
+    while (millis() - t0 < timeoutMs)
+    {
+        // --- Проверка аварийного стопа ---
+        if (digitalRead(PIN_ESTOP) == LOW) {
+            DBG_PRINTLN("[MOVE_X] ESTOP -> STOP MOVEMENT");
+            break;
+        }
+
+        int detectedBath = -1;
+
+        // читаем RFID
+        bool ok = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen);
+
+        if (ok) {
+            DBG_PRINT("[MOVE_X] Saw UID: ");
+            for (uint8_t i = 0; i < uidLen; i++) DBG_PRINTF("%02X ", uid[i]);
+            DBG_PRINTLN("");
+
+            // ищем ванну
+            detectedBath = findBathIndexByUID(uid, uidLen);
+
+            if (detectedBath >= 0) {
+                DBG_PRINTF("[MOVE_X] → detected bath index = %d\n", detectedBath);
+
+                // антидребезг: проверка, что UID стабилен
+                if (uidLen == lastLen && uidEquals(uid, lastUid, uidLen)) {
+                    stableCount++;
+                } else {
+                    memcpy(lastUid, uid, uidLen);
+                    lastLen = uidLen;
+                    stableCount = 1;
+                }
+
+                DBG_PRINTF("[MOVE_X] StableCount = %d/%d\n",
+                           stableCount, STABLE_REQUIRED);
+
+                if (stableCount >= STABLE_REQUIRED) {
+                    // стабильное распознавание ванны
+                    bathIndex = detectedBath;
+                    g_currentBath = detectedBath;
+                    shadowBath = detectedBath;     // ← синхронизируем
+                    if (detectedBath == targetBath) {
+                        DBG_PRINTLN("[MOVE_X] *** ARRIVED at target bath! ***");
+                        xFwd(false);
+                        xRev(false);
+                        return true;
+                    }
+                }
+            } else {
+                DBG_PRINTLN("[MOVE_X] UID not registered to any bath");
+            }
+        }
+
+//////
+if (dirRight) {
+    // двигаемся вправо – ванны увеличиваются
+    shadowBath++;
+} else {
+    // двигаемся влево – ванны уменьшаются
+    shadowBath--;
 }
 
+// Ограничиваем диапазон
+if (shadowBath < 0) shadowBath = 0;
+if (shadowBath >= dynamicBathCount) shadowBath = dynamicBathCount - 1;
+
+// Выводим промежуточную ванну
+g_currentBath = shadowBath;
+
+/////
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+
+    // timeout или останов
+    DBG_PRINTLN("[MOVE_X] TIMEOUT or STOP");
+    xFwd(false);
+    xRev(false);
+    return false;
+}
 // ---------------- ДВИЖЕНИЕ Z ----------------
 bool zDown_for(uint16_t sec) {
     DBG_PRINTF("[MOVE_Z] zDown_for sec=%u\r\n", sec);
@@ -1080,8 +1302,180 @@ String stateToString(ProcState st) {
         case PS_NEXT_STEP:   return F("NEXT_STEP");
         case PS_RETURN_HOME: return F("RETURN_HOME");
         case PS_ERROR:       return F("ERROR");
+        case PS_LEARN_BATHS: return F("LEARN_BATHS");   // 👈
         default:             return F("UNKNOWN");
     }
+}
+
+void handleBathsAutoLearn() {
+    DBG_PRINTLN(F("[HTTP] POST /baths_autolearn"));
+      DBG_PRINTF("Калибруем ванны...\n");
+    // Разрешаем калибровку ТОЛЬКО из IDLE
+    if (g_state != PS_IDLE) {
+        DBG_PRINTF("[HTTP]  cannot start LEARN, state=%s\n",
+                   stateToString(g_state).c_str());
+        server.send(409, "text/plain", "BUSY");
+        return;
+    }
+
+    g_stopCommand  = false;
+    g_startCommand = false;
+
+    DBG_PRINTLN(F("[HTTP]  switching to PS_LEARN_BATHS"));
+    setState(PS_LEARN_BATHS, "HTTP /baths_autolearn");
+
+    server.send(200, "text/plain", "OK");
+}
+
+void handleBathsList() {
+    DBG_PRINTLN(F("[HTTP] GET /baths_list"));
+
+    String out;
+    out.reserve(1024);
+    out = "{\"count\":";
+    out += String(dynamicBathCount);
+    out += ",\"baths\":[";
+
+    for (int i = 0; i < dynamicBathCount; ++i) {
+        if (i > 0) out += ",";
+        const BathInfo &b = g_baths[i];
+
+        out += "{";
+        out += "\"index\":" + String(i) + ",";
+        out += "\"bathNumber\":" + String(b.bathNumber) + ",";
+        out += "\"uid_len\":" + String(b.uidLen) + ",";
+
+        if (b.uidLen > 0 && b.uidLen <= 7) {
+            out += "\"uid_hex\":\"" + uidToHexString(b.uid, b.uidLen) + "\",";
+        } else {
+            out += "\"uid_hex\":\"\",";
+        }
+
+        out += "\"isStart\":" + String(b.isStart ? "true" : "false") + ",";
+        out += "\"isEnd\":"   + String(b.isEnd   ? "true" : "false");
+        out += "}";
+    }
+
+    out += "]}";
+    server.send(200, "application/json", out);
+}
+void handleBathsUpdate() {
+    DBG_PRINTLN(F("[HTTP] POST /baths_update"));
+
+    if (!server.hasArg("plain")) {
+        server.send(400, "text/plain", "No body");
+        return;
+    }
+
+    String body = server.arg("plain");
+    DBG_PRINTF("[HTTP]   bodyLen=%u\r\n", body.length());
+
+    StaticJsonDocument<4096> doc;
+    DeserializationError err = deserializeJson(doc, body);
+    if (err) {
+        DBG_PRINTLN(F("[HTTP]   JSON error"));
+        server.send(400, "text/plain", "JSON error");
+        return;
+    }
+
+    if (!doc.containsKey("baths") || !doc["baths"].is<JsonArray>()) {
+        server.send(400, "text/plain", "Expected {baths:[]}");
+        return;
+    }
+
+    JsonArray arr = doc["baths"].as<JsonArray>();
+    for (JsonObject v : arr) {
+        int idx = v["index"] | -1;
+        if (idx < 0 || idx >= dynamicBathCount) continue;
+
+        BathInfo &b = g_baths[idx];
+        b.bathNumber = v["bathNumber"] | b.bathNumber;
+        b.isStart    = v["isStart"]    | b.isStart;
+        b.isEnd      = v["isEnd"]      | b.isEnd;
+    }
+
+    saveBathListToNVS();
+    server.send(200, "text/plain", "OK");
+}
+void handleBathsLearn() {
+    DBG_PRINTLN(F("[HTTP] POST /baths_learn"));
+
+    if (!server.hasArg("index")) {
+        server.send(400, "text/plain", "index required");
+        return;
+    }
+
+    int idx = server.arg("index").toInt();
+    DBG_PRINTF("[HTTP]   index=%d\r\n", idx);
+
+    if (idx < 0) {
+        server.send(400, "text/plain", "bad index");
+        return;
+    }
+
+    // при необходимости расширяем g_baths
+    while (idx >= (int)g_baths.size() && (int)g_baths.size() < MAX_BATHS_LIMIT) {
+        BathInfo b{};
+        b.bathNumber = (uint16_t)g_baths.size();
+        b.uidLen     = 0;
+        memset(b.uid, 0, sizeof(b.uid));
+        b.isStart = (g_baths.empty());  // первую можно считать стартовой
+        b.isEnd   = false;
+        g_baths.push_back(b);
+        dynamicBathCount = (int)g_baths.size();
+    }
+
+    if (idx >= (int)g_baths.size()) {
+        server.send(500, "text/plain", "index too big");
+        return;
+    }
+
+    uint8_t uid[7] = {0};
+    uint8_t uidLen = 0;
+
+    // ждём метку до 5 секунд
+    uint32_t t0 = millis();
+    bool success = false;
+
+    while (millis() - t0 < 5000UL) {
+        if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen)) {
+            success = true;
+            break;
+        }
+        delay(50);
+    }
+
+    if (!success) {
+        server.send(408, "application/json",
+                    "{\"ok\":false,\"error\":\"timeout: tag not detected\"}");
+        return;
+    }
+
+    if (uidLen == 0 || uidLen > 7) {
+        server.send(500, "application/json",
+                    "{\"ok\":false,\"error\":\"invalid UID length\"}");
+        return;
+    }
+
+    // Записываем в структуру
+    BathInfo &b = g_baths[idx];
+    b.uidLen = uidLen;
+    memset(b.uid, 0, sizeof(b.uid));
+    memcpy(b.uid, uid, uidLen);
+
+    saveBathListToNVS();
+
+    String resp;
+    resp.reserve(128);
+    resp = "{\"ok\":true,\"index\":";
+    resp += String(idx);
+    resp += ",\"uid_len\":";
+    resp += String(uidLen);
+    resp += ",\"uid_hex\":\"";
+    resp += uidToHexString(uid, uidLen);
+    resp += "\"}";
+
+    server.send(200, "application/json", resp);
 }
 
 void handleRoot() {
@@ -1272,39 +1666,58 @@ void handleRouteApply() {
     }
     server.send(200, "text/plain", "OK");
 }
-
+void uidToHex(const uint8_t* uid, uint8_t len, char* out) {
+    char* p = out;
+    for (uint8_t i = 0; i < len; i++) {
+        sprintf(p, "%02X", uid[i]);
+        p += 2;
+        if (i < len - 1) {
+            *p++ = ':';
+        }
+    }
+    *p = '\0';
+}
 void handleStatus() {
-    DBG_PRINTLN(F("[HTTP] GET /status"));
-    // Для простоты: датчики заглушки
-    float temp_c = 25.0f;
-    float ph     = 7.0f;
+    StaticJsonDocument<1024> doc;
+
+    doc["state"] = g_state;
+    doc["state_str"] = stateToString(g_state);
+
+    // Количество ванн в текущей калибровке
+    doc["learn_count"] = dynamicBathCount;
+
+    // Последняя найденная ванна (обновляется в процессе автообучения)
+    if (dynamicBathCount > 0) {
+        auto &b = g_baths[dynamicBathCount - 1];
+        JsonObject last = doc.createNestedObject("last_found");
+
+        last["index"] = b.bathNumber;
+        last["isStart"] = b.isStart;
+        last["isEnd"]   = b.isEnd;
+
+        char uidBuf[32];
+        uidToHex(b.uid, b.uidLen, uidBuf);
+        last["uid"] = uidBuf;
+    }
+
+    // Вся таблица ванн (старая + текущая)
+    JsonArray arr = doc.createNestedArray("baths");
+    for (auto &b : g_baths) {
+        JsonObject o = arr.createNestedObject();
+        o["index"] = b.bathNumber;
+        o["isStart"] = b.isStart;
+        o["isEnd"] = b.isEnd;
+
+        char uidBuf[32];
+        uidToHex(b.uid, b.uidLen, uidBuf);
+        o["uid"] = uidBuf;
+    }
 
     String out;
-    out.reserve(256);
-    out += F("{\"time\":\"");
-    out += rtcTimeString();
-    out += F("\",\"date\":\"");
-    out += rtcDateString();
-    out += F("\",\"state\":");
-    out += String((int)g_state);
-    out += F(",\"state_str\":\"");
-    out += stateToString(g_state);
-    out += F("\",\"bath\":");
-    out += String(g_currentBath);
-    out += F(",\"step_idx\":");
-    out += String(g_stepIdx);
-    out += F(",\"steps\":");
-    out += String(g_routeSteps);
-    out += F(",\"temp_c\":");
-    out += String(temp_c, 1);
-    out += F(",\"ph\":");
-    out += String(ph, 2);
-    out += F(",\"active_route\":");
-    out += String(getActiveRouteId());
-    out += F("}");
-
+    serializeJson(doc, out);
     server.send(200, "application/json", out);
 }
+
 
 void handleStart() {
     DBG_PRINTLN(F("[HTTP] POST /start"));
@@ -1483,6 +1896,7 @@ void TaskProcess(void* pv) {
 
         switch (g_state) {
                case PS_IDLE:
+                relOffAll();   // ← добавляем
             if (g_startCommand) {
                 DBG_PRINTLN(F("[FSM] Start command in IDLE"));
                 g_startCommand = false;
@@ -1508,6 +1922,142 @@ void TaskProcess(void* pv) {
                 setState(PS_ERROR, "Homing failed");
             }
         } break;
+case PS_LEARN_BATHS: {
+    DBG_PRINTLN("[LEARN] START auto learn baths");
+
+    // --- 0. Найти стартовую и конечную ванну в старом списке ---
+    uint8_t startUid[7] = {0};
+    uint8_t endUid[7]   = {0};
+    uint8_t startLen = 0, endLen = 0;
+
+    for (auto &b : g_baths) {
+        if (b.isStart) {
+            memcpy(startUid, b.uid, b.uidLen);
+            startLen = b.uidLen;
+        }
+        if (b.isEnd) {
+            memcpy(endUid, b.uid, b.uidLen);
+            endLen = b.uidLen;
+        }
+    }
+
+    if (startLen == 0 || endLen == 0) {
+        DBG_PRINTLN("[LEARN] ERROR: start or end UID not set");
+        setState(PS_ERROR, "No start/end UID");
+        break;
+    }
+
+    DBG_PRINT("[LEARN] START UID: ");
+    for (int i=0; i<startLen; i++) DBG_PRINTF("%02X ", startUid[i]);
+    DBG_PRINTLN("");
+
+    DBG_PRINT("[LEARN] END UID:   ");
+    for (int i=0; i<endLen; i++) DBG_PRINTF("%02X ", endUid[i]);
+    DBG_PRINTLN("");
+
+    // --- 1. Очистить таблицу ---
+    g_baths.clear();
+    dynamicBathCount = 0;
+
+    // --- 2. Подготовка переменных ---
+    uint8_t lastUid[7] = {0};
+    uint8_t lastLen = 0;
+    int stable = 0;
+
+    // --- 3. Начать движение ---
+    xRev(false);
+    xFwd(true);
+
+    oledShowLearn(0, nullptr, 0);
+
+    while (true)
+    {
+        // аварийный стоп
+        if (digitalRead(PIN_ESTOP)==LOW || g_stopCommand) {
+            xFwd(false);
+            setState(PS_ERROR, "LEARN stopped");
+            break;
+        }
+
+        uint8_t uid[7];
+        uint8_t uidLen;
+        bool ok = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen);
+
+        if (ok && uidLen>0) {
+
+            // антидребезг
+            if (uidLen == lastLen && uidEquals(uid, lastUid, uidLen))
+                stable++;
+            else {
+                memcpy(lastUid, uid, uidLen);
+                lastLen = uidLen;
+                stable = 1;
+            }
+
+            if (stable >= 2) {
+
+                // проверяем — новая ли это ванна
+                int idx = findBathIndexByUID(uid, uidLen);
+                if (idx < 0) {
+                    BathInfo b{};
+                    b.bathNumber = dynamicBathCount;
+                    b.uidLen = uidLen;
+                    memcpy(b.uid, uid, uidLen);
+
+                    // стартовая — та, чья метка совпадает с сохранённым START UID
+                    b.isStart = (uidLen == startLen && uidEquals(uid, startUid, uidLen));
+                    b.isEnd   = false;
+
+                    g_baths.push_back(b);
+                    dynamicBathCount++;
+
+                    DBG_PRINTF("[LEARN] NEW BATH %d — UID: ", b.bathNumber);
+                    for (int i=0;i<uidLen;i++) DBG_PRINTF("%02X ", uid[i]);
+                    DBG_PRINTLN("");
+                }
+
+                // показать на OLED
+                oledShowLearn(dynamicBathCount, uid, uidLen);
+
+                // --- ПРОВЕРКА КОНЕЧНОЙ ВАННЫ ---
+                if (uidLen == endLen && uidEquals(uid, endUid, uidLen)) {
+                    DBG_PRINTLN("[LEARN] END bath detected!");
+                    xFwd(false);
+                    goto LEARN_DONE;
+                }
+            }
+        }
+
+        vTaskDelay(20 / portTICK_PERIOD_MS);
+    }
+
+    // fallback: последняя ванна = конечная
+    if (!g_baths.empty()) {
+        g_baths.back().isEnd = true;
+    }
+
+LEARN_DONE:
+
+    DBG_PRINTLN("[LEARN] Learning finished, saving...");
+
+    // Помечаем конечную ванну корректно
+    for (auto &b : g_baths) {
+        if (b.uidLen == endLen && uidEquals(b.uid, endUid, endLen)) {
+            b.isEnd = true;
+            break;
+        }
+    }
+
+    saveBathListToNVS();
+
+    DBG_PRINTLN("[LEARN] Returning Home...");
+    moveToBath(0, 30000);
+
+    setState(PS_IDLE, "Learn done");
+    break;
+} 
+
+break;
 
             case PS_MOVE_X: {
                 DBG_PRINTF("[FSM] MOVE_X, stepIdx=%d of %d\r\n", (int)g_stepIdx, (int)g_routeSteps);
@@ -1617,50 +2167,49 @@ void TaskUI(void* pv) {
     (void)pv;
     DBG_PRINTLN(F("[TASK] TaskUI started"));
     for (;;) {
-        if (g_inSelectMenu) {
-            // Режим выбора шаблона
-            oledShowSelectMenu();
+       if (g_inSelectMenu) {
 
-            int d = getEncDelta();
-            if (d != 0) {
-                g_selectedRoute += d;
-                if (g_selectedRoute < 0) g_selectedRoute = ROUTE_SLOTS - 1;
-                if (g_selectedRoute >= ROUTE_SLOTS) g_selectedRoute = 0;
-                DBG_PRINTF("[UI] menu changed, selectedRoute=%d\r\n", (int)g_selectedRoute);
-            }
+    // Меню выбора — разрешаем рисовать
+    oledShowSelectMenu();
 
-            // Подтверждение выбором — кнопка START
-            if (startButtonPressed()) {
-                DBG_PRINTF("[UI] menu confirm, loading slot=%d\r\n", (int)g_selectedRoute);
-                if (loadRouteSlot((uint8_t)g_selectedRoute)) {
-                    DBG_PRINTLN(F("[UI]   route loaded from slot"));
-                } else {
-                    DBG_PRINTLN(F("[UI]   loadRouteSlot failed"));
-                }
-                g_inSelectMenu = false;
-            }
+    int d = getEncDelta();
+    if (d != 0) {
+        g_selectedRoute += d;
+        if (g_selectedRoute < 0) g_selectedRoute = ROUTE_SLOTS - 1;
+        if (g_selectedRoute >= ROUTE_SLOTS) g_selectedRoute = 0;
+    }
 
-        } else {
-            // обычные экраны
-            if (g_state == PS_IDLE) {
-                oledShowIdle();
+    if (startButtonPressed()) {
+        if (loadRouteSlot((uint8_t)g_selectedRoute)) {}
+        g_inSelectMenu = false;
+    }
 
-                // старт процесса по кнопке
-                if (startButtonPressed() && g_routeSteps > 0) {
-                    DBG_PRINTLN(F("[UI] START from IDLE"));
-                    g_startCommand = true;
-                }
+} 
+else if (g_state == PS_LEARN_BATHS) {
 
-                // энкодер в IDLE => вход в меню
-                int d = getEncDelta();
-                if (d != 0) {
-                    DBG_PRINTLN(F("[UI] enter select menu"));
-                    g_inSelectMenu = true;
-                }
-            } else {
-                oledShowRun();
-            }
+    // <<< ВАЖНО! НИЧЕГО НЕ РИСУЕМ ВО ВРЕМЯ LEARN
+    // oledShowLearn вызывается только из TaskProcess
+    // Здесь — ПОЛНАЯ ТИШИНА
+    vTaskDelay(100);
+
+} 
+else {
+    // обычные экраны
+    if (g_state == PS_IDLE) {
+        oledShowIdle();
+
+        if (startButtonPressed() && g_routeSteps > 0) {
+            g_startCommand = true;
         }
+
+        if (getEncDelta() != 0) {
+            g_inSelectMenu = true;
+        }
+    } else {
+        oledShowRun();
+    }
+}
+
 
         vTaskDelay(150 / portTICK_PERIOD_MS);
     }
@@ -1796,29 +2345,61 @@ void setup() {
     Serial.println(ip);
 
     // HTTP routes
-    DBG_PRINTLN(F("[SETUP] HTTP routes init"));
-    server.on("/",          HTTP_GET,  handleRoot);
-    server.on("/status",    HTTP_GET,  handleStatus);
-    server.on("/start",     HTTP_POST, handleStart);
-    server.on("/stop",      HTTP_POST, handleStop);
-    server.on("/route",     HTTP_POST, handleRoutePost);
-    server.on("/monitor",   HTTP_GET,  []() {
-        DBG_PRINTLN(F("[HTTP] GET /monitor"));
-        server.send_P(200, "text/html", WEB_UI_MONITOR);
-    });
-    server.on("/bath_data",    HTTP_GET, handleBathData);
-    server.on("/bath_history", HTTP_GET, handleBathHistory);
-    server.on("/routes_list",  HTTP_GET,  handleRoutesList);
-    server.on("/route_get",    HTTP_GET,  handleRouteGet);
-    server.on("/route_save",   HTTP_POST, handleRouteSaveLib);
-    server.on("/route_delete", HTTP_DELETE, handleRouteDelete);
-    server.on("/route_apply",  HTTP_POST,  handleRouteApply);
+   // HTTP routes
+DBG_PRINTLN(F("[SETUP] HTTP routes init"));
 
-    // страница редактора шаблонов
-    server.on("/routes_ui", HTTP_GET, []() {
-        DBG_PRINTLN(F("[HTTP] GET /routes_ui"));
-        server.send_P(200, "text/html", WEB_UI_ROUTES);
-    });
+server.on("/", HTTP_GET, handleRoot);
+server.on("/status", HTTP_GET, handleStatus);
+server.on("/start", HTTP_POST, handleStart);
+server.on("/stop", HTTP_POST, handleStop);
+server.on("/route", HTTP_POST, handleRoutePost);
+
+server.on("/bath_data", HTTP_GET, handleBathData);
+server.on("/bath_history", HTTP_GET, handleBathHistory);
+
+server.on("/routes_list", HTTP_GET, handleRoutesList);
+server.on("/route_get", HTTP_GET, handleRouteGet);
+server.on("/route_save", HTTP_POST, handleRouteSaveLib);
+server.on("/route_delete", HTTP_DELETE, handleRouteDelete);
+server.on("/route_apply", HTTP_POST, handleRouteApply);
+
+server.on("/baths_list", HTTP_GET, handleBathsList);
+server.on("/baths_update", HTTP_POST, handleBathsUpdate);
+server.on("/baths_learn", HTTP_POST, handleBathsLearn);
+server.on("/baths_autolearn", HTTP_POST, handleBathsAutoLearn);
+
+// ============================
+//    *** UI ROUTES ***
+// ============================
+
+// MONITOR PAGE
+server.on("/monitor", HTTP_GET, []() {
+    DBG_PRINTLN(F("[HTTP] GET /monitor"));
+    String page = renderPageMonitor();
+    server.send(200, "text/html", page);
+});
+
+// ROUTES PAGE
+server.on("/routes_ui", HTTP_GET, []() {
+    DBG_PRINTLN(F("[HTTP] GET /routes_ui"));
+    String page = renderPageRoutes();
+    server.send(200, "text/html", page);
+});
+
+// BATHS (RFID BINDING) PAGE
+server.on("/baths_ui", HTTP_GET, []() {
+    DBG_PRINTLN(F("[HTTP] GET /baths_ui"));
+    String page = renderPageBaths();
+    server.send(200, "text/html", page);
+});
+
+// AUTOLEARN PAGE
+server.on("/baths_autolearn_ui", HTTP_GET, []() {
+    DBG_PRINTLN(F("[HTTP] GET /baths_autolearn_ui"));
+    String page = renderPageAutoLearn();
+    server.send(200, "text/html", page);
+});
+
     server.begin();
     DBG_PRINTLN(F("[SETUP] HTTP server started"));
 

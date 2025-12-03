@@ -1,4 +1,5 @@
 #pragma once
-#include <Arduino.h>
+#include <pgmspace.h>
 
-extern const char WEB_UI_ROUTES[] PROGMEM;
+extern const char WEB_ROUTES_CONTENT[];
+String renderPageRoutes();

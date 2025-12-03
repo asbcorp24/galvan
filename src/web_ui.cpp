@@ -258,6 +258,8 @@ const char WEB_UI_INDEX[] PROGMEM = R"rawliteral(
         <a href="/" class="nav-link active"><span class="icon">⚙</span>Панель управления</a>
         <a href="/monitor" class="nav-link"><span class="icon">📈</span>Монитор ванн</a>
         <a href="/routes_ui" class="nav-link"><span class="icon">📋</span>Рецепты / паттерны</a>
+              <a href="/baths_ui" class="nav-link active"><span class="icon">🛰</span>Привязка RFID</a>
+                                 <a href="/baths_autolearn_ui" class="nav-link active"><span class="icon">🛰</span>Калибровка</a>
     </nav>
 
     <div class="layout">
