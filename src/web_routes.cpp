@@ -81,7 +81,7 @@ const char WEB_ROUTES_CONTENT[] PROGMEM = R"rawliteral(
             </div>
 
             <div class="label" style="margin-top:6px;">
-                Структура шага: ванна → опускание (Z↓) → выдержка → подъём (Z↑) → сушка + флаги Spin/Fan.
+                Структура шага: ванна → Z↓ уровень + таймаут → выдержка → Z↑ уровень + таймаут → сушка + флаги Spin/Fan.
             </div>
 
             <div style="margin-top:8px; overflow-x:auto;">
@@ -90,9 +90,11 @@ const char WEB_ROUTES_CONTENT[] PROGMEM = R"rawliteral(
                     <tr>
                         <th>#</th>
                         <th>Ванна</th>
-                        <th>Z↓, c</th>
+                        <th>Z↓ ур.</th>
+                        <th>Z↓ тайм., c</th>
                         <th>Выдержка, c</th>
-                        <th>Z↑, c</th>
+                        <th>Z↑ ур.</th>
+                        <th>Z↑ тайм., c</th>
                         <th>Сушка, c</th>
                         <th>Spin</th>
                         <th>Fan</th>
@@ -227,22 +229,33 @@ function renumberSteps() {
 function createStepRow(data) {
     const defaults = {
         bath: 1,
-        z_down_s: 3,
+        z_level_down: 1,
+        z_down_timeout_s: 3,
         hold_s: 60,
-        z_up_s: 3,
+        z_level_up: 0,
+        z_up_timeout_s: 3,
         dry_s: 10,
         spin: false,
         fan: false
     };
-    const s = Object.assign({}, defaults, data || {});
+    const normalized = Object.assign({}, data || {});
+    if (normalized.z_down_timeout_s == null && normalized.z_down_s != null) {
+        normalized.z_down_timeout_s = normalized.z_down_s;
+    }
+    if (normalized.z_up_timeout_s == null && normalized.z_up_s != null) {
+        normalized.z_up_timeout_s = normalized.z_up_s;
+    }
+    const s = Object.assign({}, defaults, normalized);
 
     const tr = document.createElement("tr");
     tr.innerHTML = `
         <td class="col-idx"></td>
         <td><input type="number" min="0" max="65535" value="${s.bath}"></td>
-        <td><input type="number" min="0" max="65535" value="${s.z_down_s}"></td>
+        <td><input type="number" min="0" max="65535" value="${s.z_level_down}"></td>
+        <td><input type="number" min="0" max="65535" value="${s.z_down_timeout_s}"></td>
         <td><input type="number" min="0" max="65535" value="${s.hold_s}"></td>
-        <td><input type="number" min="0" max="65535" value="${s.z_up_s}"></td>
+        <td><input type="number" min="0" max="65535" value="${s.z_level_up}"></td>
+        <td><input type="number" min="0" max="65535" value="${s.z_up_timeout_s}"></td>
         <td><input type="number" min="0" max="65535" value="${s.dry_s}"></td>
         <td><input type="checkbox" ${s.spin ? "checked" : ""}></td>
         <td><input type="checkbox" ${s.fan ? "checked" : ""}></td>
@@ -264,17 +277,21 @@ function getStepsFromTable() {
         const cells = tr.querySelectorAll("td");
         const num = idx => parseInt(cells[idx].querySelector("input").value || "0", 10);
         const bath   = num(1);
-        const zDown  = num(2);
-        const hold   = num(3);
-        const zUp    = num(4);
-        const dry    = num(5);
-        const spinOn = cells[6].querySelector("input").checked;
-        const fanOn  = cells[7].querySelector("input").checked;
+        const zDownLevel = num(2);
+        const zDownTimeout = num(3);
+        const hold   = num(4);
+        const zUpLevel = num(5);
+        const zUpTimeout = num(6);
+        const dry    = num(7);
+        const spinOn = cells[8].querySelector("input").checked;
+        const fanOn  = cells[9].querySelector("input").checked;
         steps.push({
             bath: bath,
-            z_down_s: zDown,
+            z_level_down: zDownLevel,
+            z_down_timeout_s: zDownTimeout,
             hold_s: hold,
-            z_up_s: zUp,
+            z_level_up: zUpLevel,
+            z_up_timeout_s: zUpTimeout,
             dry_s: dry,
             spin: spinOn,
             fan: fanOn
@@ -465,7 +482,7 @@ function createNewRoute() {
     currentRouteId = id;
     setText("editRouteId", id);
     clearStepsTable();
-    createStepRow({bath: 1, hold_s: 60});
+    createStepRow({bath: 1, z_level_down: 1, z_down_timeout_s: 3, hold_s: 60, z_level_up: 0, z_up_timeout_s: 3});
     setEditorMsg(true, "Создан новый рецепт #" + id + " (пока только в редакторе, сохраните его)");
 }
 

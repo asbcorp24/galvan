@@ -7,9 +7,8 @@ const char WEB_AUTLEARN_CONTENT[] PROGMEM = R"rawliteral(
     <h2><span class="dot"></span> Автокалибровка линии ванн</h2>
 
     <p style="color:var(--muted); font-size:0.9rem;">
-        Мост автоматически проедет вдоль линии. По мере проезда он будет определять <b>логические ванны</b>
-        по RFID-меткам. Первая и последняя точки — это <b>точка старта</b> и <b>точка окончания линии</b>,
-        а не ванны.
+        Автокалибровка использует отдельные служебные RFID метки <b>Start</b> и <b>End</b>. Всё, что между ними,
+        контроллер запоминает как рабочие ванны процесса и нумерует по порядку для рецептов.
     </p>
 
     <button class="primary" id="btnStart" style="width:100%; margin-bottom:14px;">
@@ -76,8 +75,14 @@ document.getElementById("btnStart").onclick = () => {
 function renderLastFound(b){
     if (!b) return;
 
+    const title =
+        b.kind_str === "start" ? "Стартовая точка линии" :
+        b.kind_str === "end" ? "Конечная точка линии" :
+        b.kind_str === "z_level" ? ("Z-уровень " + b.index) :
+        ("Рабочая ванна №" + b.index);
+
     let html = `
-        <div><b>Логическая ванна №${b.index}</b></div>
+        <div><b>${title}</b></div>
         <div style="margin-top:4px;">UID: <span style="color:var(--accent);">${b.uid}</span></div>
 
         <div style="margin-top:6px; font-size:0.85rem;">
@@ -100,14 +105,6 @@ function renderFoundList(list){
                 <div class="bath-name">Ванна №${b.index}</div>
                 <div class="badge">${b.uid}</div>
             </div>
-
-            ${b.isStart 
-                ? "<div class='status-tag' style='color:#00ff9d'>Старт линии</div>"
-                : ""}
-
-            ${b.isEnd 
-                ? "<div class='status-tag' style='color:#ff7979'>Конец линии</div>"
-                : ""}
         `;
         div.appendChild(el);
     });

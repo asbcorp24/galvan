@@ -69,7 +69,6 @@
 #define SW_Z_TOP     14
 #define SW_Z_BOTTOM  13
 
-#define PN532_IRQ   14   // можно не использовать
 #define PN532_RESET 27
 // Аварийный стоп
 #define PIN_ESTOP  26
@@ -98,6 +97,10 @@ volatile int16_t g_targetBath = -1;
 // Ключи в NVS
 static const char* NVS_KEY_BATH_COUNT = "bath_cnt";
 static const char* NVS_KEY_BATH_TAGS  = "bath_tags";
+static const char* NVS_KEY_START_POINT = "start_pt";
+static const char* NVS_KEY_END_POINT   = "end_pt";
+static const char* NVS_KEY_ZTAG_COUNT  = "ztag_cnt";
+static const char* NVS_KEY_ZTAG_DATA   = "ztag_data";
 
 // --- ДИНАМИЧЕСКОЕ КОЛИЧЕСТВО ВАНН ---
 
@@ -120,7 +123,41 @@ struct BathHistRec {
 BathHistRec hist[MAX_BATHS_LIMIT][HIST_LEN];
 uint16_t    histPtr[MAX_BATHS_LIMIT] = {0};
 
-// Описание одной ванны с RFID
+enum LinePointKind : uint8_t {
+    LPK_PROCESS = 0,
+    LPK_START   = 1,
+    LPK_END     = 2,
+    LPK_SERVICE = 3
+};
+
+enum LastDetectedKind : uint8_t {
+    LDK_NONE    = 0,
+    LDK_PROCESS = 1,
+    LDK_START   = 2,
+    LDK_END     = 3,
+    LDK_Z_LEVEL = 4
+};
+
+struct ServicePointInfo {
+    uint8_t uidLen;
+    uint8_t uid[7];
+    bool configured;
+};
+
+struct ZTagInfo {
+    int16_t level;
+    uint8_t uidLen;
+    uint8_t uid[7];
+};
+
+struct LastDetectedInfo {
+    uint8_t kind;
+    int16_t number;
+    uint8_t uidLen;
+    uint8_t uid[7];
+};
+
+// Описание рабочей ванны с RFID
 struct BathInfo {
     uint16_t bathNumber;   // логический номер ванны (для маршрутов)
     uint8_t  uidLen;       // длина UID
@@ -131,6 +168,11 @@ struct BathInfo {
 
 // Динамический список ванн
 std::vector<BathInfo> g_baths;
+std::vector<ZTagInfo> g_zTags;
+ServicePointInfo g_startPoint = {};
+ServicePointInfo g_endPoint   = {};
+LastDetectedInfo g_lastDetected = {};
+volatile int16_t g_currentZLevel = -1;
 
 
 // слоты шаблонов
@@ -143,11 +185,22 @@ U8G2_FOR_ADAFRUIT_GFX u8g2;
 #pragma pack(push,1)
 struct Step {
     uint16_t bath;
+    uint16_t z_level_down;
+    uint16_t z_down_timeout_s;
+    uint16_t hold_s;
+    uint16_t z_level_up;
+    uint16_t z_up_timeout_s;
+    uint16_t dry_s;
+    uint16_t flags; // bit0=spin, bit1=fan
+};
+
+struct LegacyStep {
+    uint16_t bath;
     uint16_t hold_s;
     uint16_t z_down_s;
     uint16_t z_up_s;
     uint16_t dry_s;
-    uint16_t flags; // bit0=spin, bit1=fan
+    uint16_t flags;
 };
 #pragma pack(pop)
 
@@ -204,8 +257,8 @@ volatile int16_t bathIndex = 0;
 volatile bool    dirRight  = true;
 
 
-// Используем только I2C (SDA=21, SCL=22), IRQ/RESET НЕ НУЖНЫ ДЛЯ I2C
-Adafruit_PN532 nfc(PN532_IRQ, PN532_RESET, &Wire);
+// PN532 работает по I2C, поэтому IRQ не используем и не конфликтуем с концевиком Z.
+Adafruit_PN532 nfc(&Wire);
 
 
 
@@ -228,6 +281,12 @@ struct BathRecordNVS {
     uint8_t  uid[7];
     uint8_t  flags;   // bit0 = isStart, bit1 = isEnd
 };
+
+struct ZTagRecordNVS {
+    int16_t  level;
+    uint8_t  uidLen;
+    uint8_t  uid[7];
+};
 // Преобразовать UID в hex-строку без пробелов
 String uidToHexString(const uint8_t *uid, uint8_t len) {
     String s;
@@ -238,6 +297,105 @@ String uidToHexString(const uint8_t *uid, uint8_t len) {
     }
     s.toUpperCase();
     return s;
+}
+
+void clearServicePoint(ServicePointInfo &point) {
+    point.uidLen = 0;
+    memset(point.uid, 0, sizeof(point.uid));
+    point.configured = false;
+}
+
+void setServicePoint(ServicePointInfo &point, const uint8_t *uid, uint8_t uidLen) {
+    clearServicePoint(point);
+    if (uidLen == 0 || uidLen > 7) return;
+    point.uidLen = uidLen;
+    memcpy(point.uid, uid, uidLen);
+    point.configured = true;
+}
+
+bool servicePointMatches(const ServicePointInfo &point, const uint8_t *uid, uint8_t uidLen) {
+    if (!point.configured || point.uidLen != uidLen) return false;
+    for (uint8_t i = 0; i < uidLen; ++i) {
+        if (point.uid[i] != uid[i]) return false;
+    }
+    return true;
+}
+
+void noteLastDetected(uint8_t kind, int16_t number, const uint8_t *uid, uint8_t uidLen) {
+    g_lastDetected.kind = kind;
+    g_lastDetected.number = number;
+    g_lastDetected.uidLen = uidLen > 7 ? 7 : uidLen;
+    memset(g_lastDetected.uid, 0, sizeof(g_lastDetected.uid));
+    if (g_lastDetected.uidLen > 0) {
+        memcpy(g_lastDetected.uid, uid, g_lastDetected.uidLen);
+    }
+}
+
+void saveServicePointToNVS(const char *key, const ServicePointInfo &point) {
+    prefs.begin(NVS_NS, false);
+    prefs.putBytes(key, &point, sizeof(ServicePointInfo));
+    prefs.end();
+}
+
+void loadServicePointFromNVS(const char *key, ServicePointInfo &point) {
+    clearServicePoint(point);
+    prefs.begin(NVS_NS, true);
+    size_t have = prefs.getBytesLength(key);
+    if (have >= sizeof(ServicePointInfo)) {
+        prefs.getBytes(key, &point, sizeof(ServicePointInfo));
+    }
+    prefs.end();
+    if (point.uidLen > 7) {
+        clearServicePoint(point);
+    }
+}
+
+void saveZTagsToNVS() {
+    prefs.begin(NVS_NS, false);
+    uint16_t count = (uint16_t)g_zTags.size();
+    prefs.putUShort(NVS_KEY_ZTAG_COUNT, count);
+    if (count == 0) {
+        prefs.remove(NVS_KEY_ZTAG_DATA);
+        prefs.end();
+        return;
+    }
+
+    ZTagRecordNVS records[MAX_BATHS_LIMIT];
+    for (uint16_t i = 0; i < count && i < MAX_BATHS_LIMIT; ++i) {
+        records[i].level = g_zTags[i].level;
+        records[i].uidLen = g_zTags[i].uidLen;
+        memset(records[i].uid, 0, sizeof(records[i].uid));
+        if (g_zTags[i].uidLen > 0 && g_zTags[i].uidLen <= 7) {
+            memcpy(records[i].uid, g_zTags[i].uid, g_zTags[i].uidLen);
+        }
+    }
+    prefs.putBytes(NVS_KEY_ZTAG_DATA, records, count * sizeof(ZTagRecordNVS));
+    prefs.end();
+}
+
+void loadZTagsFromNVS() {
+    g_zTags.clear();
+    prefs.begin(NVS_NS, true);
+    uint16_t count = prefs.getUShort(NVS_KEY_ZTAG_COUNT, 0);
+    size_t have = prefs.getBytesLength(NVS_KEY_ZTAG_DATA);
+    if (count == 0 || count > MAX_BATHS_LIMIT || have < count * sizeof(ZTagRecordNVS)) {
+        prefs.end();
+        return;
+    }
+
+    ZTagRecordNVS records[MAX_BATHS_LIMIT];
+    prefs.getBytes(NVS_KEY_ZTAG_DATA, records, count * sizeof(ZTagRecordNVS));
+    prefs.end();
+
+    g_zTags.reserve(count);
+    for (uint16_t i = 0; i < count; ++i) {
+        if (records[i].uidLen == 0 || records[i].uidLen > 7) continue;
+        ZTagInfo z{};
+        z.level = records[i].level;
+        z.uidLen = records[i].uidLen;
+        memcpy(z.uid, records[i].uid, z.uidLen);
+        g_zTags.push_back(z);
+    }
 }
 // Сохранение bathList в NVS
 void saveBathListToNVS() {
@@ -337,8 +495,27 @@ void loadBathListFromNVS() {
     dynamicBathCount = (int)g_baths.size();
 
     Serial.printf("[NVS] Loaded %d baths\n", dynamicBathCount);
+}
 
-    
+void migrateLegacyServiceFlagsIfNeeded() {
+    bool changed = false;
+    if (g_startPoint.configured && g_endPoint.configured) return;
+
+    for (const auto &b : g_baths) {
+        if (!g_startPoint.configured && b.isStart && b.uidLen > 0) {
+            setServicePoint(g_startPoint, b.uid, b.uidLen);
+            changed = true;
+        }
+        if (!g_endPoint.configured && b.isEnd && b.uidLen > 0) {
+            setServicePoint(g_endPoint, b.uid, b.uidLen);
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        if (g_startPoint.configured) saveServicePointToNVS(NVS_KEY_START_POINT, g_startPoint);
+        if (g_endPoint.configured) saveServicePointToNVS(NVS_KEY_END_POINT, g_endPoint);
+    }
 }
 
 // ------------------------------------------------------
@@ -360,6 +537,62 @@ int findBathIndexByUID(const uint8_t uid[], uint8_t uidLen) {
         if (same) return i;
     }
     return -1;
+}
+
+int findBathStorageIndexByNumber(uint16_t bathNumber) {
+    for (int i = 0; i < (int)g_baths.size(); ++i) {
+        if (g_baths[i].bathNumber == bathNumber) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+int findBathStorageIndexByFlag(bool wantStart) {
+    for (int i = 0; i < (int)g_baths.size(); ++i) {
+        if (wantStart && g_baths[i].isStart) return i;
+        if (!wantStart && g_baths[i].isEnd) return i;
+    }
+    return -1;
+}
+
+uint16_t getBathDisplayNumberByIndex(int storageIndex) {
+    if (storageIndex >= 0 && storageIndex < (int)g_baths.size()) {
+        return g_baths[storageIndex].bathNumber;
+    }
+    return (storageIndex >= 0) ? (uint16_t)storageIndex : 0;
+}
+
+int findZTagIndexByUID(const uint8_t uid[], uint8_t uidLen) {
+    if (uidLen == 0 || uidLen > 7) return -1;
+    for (int i = 0; i < (int)g_zTags.size(); ++i) {
+        if (g_zTags[i].uidLen != uidLen) continue;
+        bool same = true;
+        for (uint8_t j = 0; j < uidLen; ++j) {
+            if (g_zTags[i].uid[j] != uid[j]) {
+                same = false;
+                break;
+            }
+        }
+        if (same) return i;
+    }
+    return -1;
+}
+
+int findZTagIndexByLevel(int16_t level) {
+    for (int i = 0; i < (int)g_zTags.size(); ++i) {
+        if (g_zTags[i].level == level) return i;
+    }
+    return -1;
+}
+
+bool captureKnownZLevel(const uint8_t uid[], uint8_t uidLen) {
+    int zIdx = findZTagIndexByUID(uid, uidLen);
+    if (zIdx < 0) return false;
+    g_currentZLevel = g_zTags[zIdx].level;
+    noteLastDetected(LDK_Z_LEVEL, g_currentZLevel, uid, uidLen);
+    DBG_PRINTF("[MOVE_Z] Detected Z level=%d\r\n", (int)g_currentZLevel);
+    return true;
 }
 
 // Добавить новую ванну или обновить существующую
@@ -447,16 +680,24 @@ bool loadRouteSlot(uint8_t slot) {
         DBG_PRINTLN(F("[NVS]  invalid steps count"));
         return false;
     }
-    size_t need = n * sizeof(Step);
     size_t have = prefs.getBytesLength(keyData);
-    DBG_PRINTF("[NVS]  need=%u, have=%u\r\n", (unsigned)need, (unsigned)have);
-    if (have < need) {
+    DBG_PRINTF("[NVS]  need(new)=%u, need(old)=%u, have=%u\r\n",
+               (unsigned)(n * sizeof(Step)),
+               (unsigned)(n * sizeof(LegacyStep)),
+               (unsigned)have);
+    if (have == 0) {
         prefs.end();
         DBG_PRINTLN(F("[NVS]  not enough data"));
         return false;
     }
-    prefs.getBytes(keyData, g_route, need);
+    uint8_t rawBuf[ROUTE_MAX_STEPS * sizeof(Step)] = {0};
+    prefs.getBytes(keyData, rawBuf, have > sizeof(rawBuf) ? sizeof(rawBuf) : have);
     prefs.end();
+
+    if (!decodeRouteBytes(rawBuf, have, n, g_route)) {
+        DBG_PRINTLN(F("[NVS]  route bytes incompatible"));
+        return false;
+    }
 
     g_routeSteps = n;
     DBG_PRINTF("[NVS]  route loaded, g_routeSteps=%u\r\n", g_routeSteps);
@@ -471,6 +712,32 @@ bool saveRoute(const Step* steps, uint16_t count) {
 bool loadRoute() {
     DBG_PRINTLN(F("[NVS] loadRoute (active slot 0)"));
     return loadRouteSlot(0);
+}
+
+bool decodeRouteBytes(const void *raw, size_t haveBytes, uint16_t stepCount, Step *dst) {
+    const size_t needNew = stepCount * sizeof(Step);
+    if (haveBytes >= needNew) {
+        memcpy(dst, raw, needNew);
+        return true;
+    }
+
+    const size_t needLegacy = stepCount * sizeof(LegacyStep);
+    if (haveBytes >= needLegacy) {
+        const LegacyStep *legacy = static_cast<const LegacyStep*>(raw);
+        for (uint16_t i = 0; i < stepCount; ++i) {
+            dst[i].bath = legacy[i].bath;
+            dst[i].z_level_down = 1;
+            dst[i].z_down_timeout_s = legacy[i].z_down_s;
+            dst[i].hold_s = legacy[i].hold_s;
+            dst[i].z_level_up = 0;
+            dst[i].z_up_timeout_s = legacy[i].z_up_s;
+            dst[i].dry_s = legacy[i].dry_s;
+            dst[i].flags = legacy[i].flags;
+        }
+        return true;
+    }
+
+    return false;
 }
 
 // Парсим CSV "1,2,5" в массив uint16
@@ -569,15 +836,20 @@ bool loadLibRoute(uint16_t id, Step* dst, uint16_t &countOut) {
         DBG_PRINTLN(F("[NVS]  no such route or invalid count"));
         return false;
     }
-    size_t need = n * sizeof(Step);
     size_t have = prefs.getBytesLength(keyData);
-    if (have < need) {
+    if (have == 0) {
         prefs.end();
         DBG_PRINTLN(F("[NVS]  not enough bytes in NVS"));
         return false;
     }
-    prefs.getBytes(keyData, dst, need);
+    uint8_t rawBuf[ROUTE_MAX_STEPS * sizeof(Step)] = {0};
+    prefs.getBytes(keyData, rawBuf, have > sizeof(rawBuf) ? sizeof(rawBuf) : have);
     prefs.end();
+
+    if (!decodeRouteBytes(rawBuf, have, n, dst)) {
+        DBG_PRINTLN(F("[NVS]  route bytes incompatible"));
+        return false;
+    }
     countOut = n;
     DBG_PRINTF("[NVS]  loaded %u steps\r\n", countOut);
     return true;
@@ -1101,24 +1373,24 @@ bool startButtonPressed() {
     return false;
 }*/
 // Улучшенное движение к ванне по RFID
-bool moveToBath(int targetBath, uint32_t timeoutMs)
+bool moveToBathIndex(int targetBathIndex, uint32_t timeoutMs)
 {
-    DBG_PRINTF("\n[MOVE_X] >>> moveToBath(target=%d, current=%d)\n",
-               targetBath, bathIndex);
-shadowBath = bathIndex;  // стартуем с текущей подтверждённой ванны
-g_targetBath = targetBath;
+    DBG_PRINTF("\n[MOVE_X] >>> moveToBathIndex(targetIndex=%d, currentIndex=%d)\n",
+               targetBathIndex, bathIndex);
+    shadowBath = bathIndex;  // стартуем с текущей подтверждённой точki
+    g_targetBath = getBathDisplayNumberByIndex(targetBathIndex);
     uint32_t t0 = millis();
-/////
-    if (targetBath == bathIndex) {
+
+    if (targetBathIndex == bathIndex) {
         DBG_PRINTLN("[MOVE_X] Already at target bath");
         xFwd(false);
         xRev(false);
-        g_currentBath = bathIndex;
+        g_currentBath = getBathDisplayNumberByIndex(bathIndex);
         return true;
     }
 
     // направление
-    dirRight = (targetBath > bathIndex);
+    dirRight = (targetBathIndex > bathIndex);
     DBG_PRINTF("[MOVE_X] Direction = %s\n", dirRight ? "RIGHT" : "LEFT");
 
     if (dirRight) {
@@ -1177,9 +1449,10 @@ g_targetBath = targetBath;
                 if (stableCount >= STABLE_REQUIRED) {
                     // стабильное распознавание ванны
                     bathIndex = detectedBath;
-                    g_currentBath = detectedBath;
+                    g_currentBath = getBathDisplayNumberByIndex(detectedBath);
                     shadowBath = detectedBath;     // ← синхронизируем
-                    if (detectedBath == targetBath) {
+                    noteLastDetected(LDK_PROCESS, g_currentBath, uid, uidLen);
+                    if (detectedBath == targetBathIndex) {
                         DBG_PRINTLN("[MOVE_X] *** ARRIVED at target bath! ***");
                         xFwd(false);
                         xRev(false);
@@ -1205,7 +1478,7 @@ if (shadowBath < 0) shadowBath = 0;
 if (shadowBath >= dynamicBathCount) shadowBath = dynamicBathCount - 1;
 
 // Выводим промежуточную ванну
-g_currentBath = shadowBath;
+g_currentBath = getBathDisplayNumberByIndex(shadowBath);
 
 /////
         vTaskDelay(10 / portTICK_PERIOD_MS);
@@ -1216,6 +1489,83 @@ g_currentBath = shadowBath;
     xFwd(false);
     xRev(false);
     return false;
+}
+
+bool moveToBathNumber(uint16_t bathNumber, uint32_t timeoutMs) {
+    int targetIndex = findBathStorageIndexByNumber(bathNumber);
+    if (targetIndex < 0) {
+        DBG_PRINTF("[MOVE_X] bathNumber=%u not found in config\r\n", bathNumber);
+        return false;
+    }
+    return moveToBathIndex(targetIndex, timeoutMs);
+}
+
+bool moveToServicePoint(const ServicePointInfo &point, const char *label, bool isStartPoint, bool moveRight, uint32_t timeoutMs) {
+    if (!point.configured || point.uidLen == 0) {
+        DBG_PRINTF("[MOVE_X] %s point is not configured\r\n", label ? label : "service");
+        return false;
+    }
+
+    uint32_t t0 = millis();
+    shadowBath = bathIndex;
+    g_targetBath = -1;
+    dirRight = moveRight;
+    if (moveRight) {
+        xRev(false);
+        xFwd(true);
+    } else {
+        xFwd(false);
+        xRev(true);
+    }
+
+    uint8_t lastUid[7] = {0};
+    uint8_t lastLen = 0;
+    int stableCount = 0;
+    const int STABLE_REQUIRED = 2;
+
+    while (millis() - t0 < timeoutMs) {
+        if (digitalRead(PIN_ESTOP) == LOW) {
+            DBG_PRINTLN("[MOVE_X] ESTOP while moving to service point");
+            break;
+        }
+
+        uint8_t uid[7];
+        uint8_t uidLen = 0;
+        if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen)) {
+            int detectedBath = findBathIndexByUID(uid, uidLen);
+            if (detectedBath >= 0) {
+                bathIndex = detectedBath;
+                shadowBath = detectedBath;
+                g_currentBath = getBathDisplayNumberByIndex(detectedBath);
+            }
+
+            if (uidLen == lastLen && uidEquals(uid, lastUid, uidLen)) {
+                stableCount++;
+            } else {
+                memcpy(lastUid, uid, uidLen);
+                lastLen = uidLen;
+                stableCount = 1;
+            }
+
+            if (stableCount >= STABLE_REQUIRED && servicePointMatches(point, uid, uidLen)) {
+                xFwd(false);
+                xRev(false);
+                noteLastDetected(isStartPoint ? LDK_START : LDK_END, -1, uid, uidLen);
+                DBG_PRINTF("[MOVE_X] Arrived at %s point\r\n", label ? label : "service");
+                return true;
+            }
+        }
+
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+
+    xFwd(false);
+    xRev(false);
+    return false;
+}
+
+bool moveToStartPoint(uint32_t timeoutMs) {
+    return moveToServicePoint(g_startPoint, "start", true, false, timeoutMs);
 }
 // ---------------- ДВИЖЕНИЕ Z ----------------
 bool zDown_for(uint16_t sec) {
@@ -1230,6 +1580,12 @@ bool zDown_for(uint16_t sec) {
         if (digitalRead(PIN_ESTOP) == LOW) {
             DBG_PRINTLN(F("[MOVE_Z] ESTOP while moving down"));
             break;
+        }
+
+        uint8_t uid[7] = {0};
+        uint8_t uidLen = 0;
+        if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen)) {
+            captureKnownZLevel(uid, uidLen);
         }
 
         // вниз нельзя, если верхний концевик нажат (мы уже вверху)
@@ -1267,6 +1623,12 @@ bool zUp_for(uint16_t sec) {
             break;
         }
 
+        uint8_t uid[7] = {0};
+        uint8_t uidLen = 0;
+        if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen)) {
+            captureKnownZLevel(uid, uidLen);
+        }
+
         // вверх нельзя, если нижний концевик нажат
         if (digitalRead(SW_Z_BOTTOM) == LOW) {
             DBG_PRINTLN(F("[MOVE_Z] SW_Z_BOTTOM active while going up, error"));
@@ -1286,6 +1648,86 @@ bool zUp_for(uint16_t sec) {
     bool ok = (millis() - t0 < timeout);
     DBG_PRINTF("[MOVE_Z] zUp_for done, ok=%d\r\n", (int)ok);
     return ok;
+}
+
+bool moveZToLevel(int16_t targetLevel, bool moveDown, uint16_t timeoutSec) {
+    const bool haveTargetLevel = (targetLevel >= 0) && (findZTagIndexByLevel(targetLevel) >= 0);
+    const uint32_t timeoutMs = (uint32_t)(timeoutSec > 0 ? timeoutSec : 1) * 1000UL;
+
+    DBG_PRINTF("[MOVE_Z] moveZToLevel target=%d dir=%s timeout=%us haveTarget=%d\r\n",
+               (int)targetLevel,
+               moveDown ? "DOWN" : "UP",
+               (unsigned)timeoutSec,
+               haveTargetLevel ? 1 : 0);
+
+    if (haveTargetLevel && g_currentZLevel == targetLevel) {
+        DBG_PRINTLN(F("[MOVE_Z] Already at target Z level"));
+        return true;
+    }
+
+    if (!haveTargetLevel) {
+        DBG_PRINTLN(F("[MOVE_Z] Target Z level not configured, fallback to timeout motion"));
+        return moveDown ? zDown_for(timeoutSec) : zUp_for(timeoutSec);
+    }
+
+    const uint32_t t0 = millis();
+    if (moveDown) {
+        zUpRelay(false);
+        zDownRelay(true);
+    } else {
+        zDownRelay(false);
+        zUpRelay(true);
+    }
+
+    while (millis() - t0 < timeoutMs) {
+        if (digitalRead(PIN_ESTOP) == LOW) {
+            DBG_PRINTLN(F("[MOVE_Z] ESTOP during moveZToLevel"));
+            break;
+        }
+
+        uint8_t uid[7] = {0};
+        uint8_t uidLen = 0;
+        if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen)) {
+            captureKnownZLevel(uid, uidLen);
+            if (g_currentZLevel == targetLevel) {
+                zDownRelay(false);
+                zUpRelay(false);
+                DBG_PRINTLN(F("[MOVE_Z] Target Z level reached"));
+                return true;
+            }
+        }
+
+        if (moveDown) {
+            if (digitalRead(SW_Z_TOP) == LOW) {
+                DBG_PRINTLN(F("[MOVE_Z] SW_Z_TOP active while moving down"));
+                zDownRelay(false);
+                return false;
+            }
+            if (digitalRead(SW_Z_BOTTOM) == LOW) {
+                DBG_PRINTLN(F("[MOVE_Z] Reached bottom switch before target level"));
+                zDownRelay(false);
+                return false;
+            }
+        } else {
+            if (digitalRead(SW_Z_BOTTOM) == LOW) {
+                DBG_PRINTLN(F("[MOVE_Z] SW_Z_BOTTOM active while moving up"));
+                zUpRelay(false);
+                return false;
+            }
+            if (digitalRead(SW_Z_TOP) == LOW) {
+                DBG_PRINTLN(F("[MOVE_Z] Reached top switch before target level"));
+                zUpRelay(false);
+                return false;
+            }
+        }
+
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+
+    zDownRelay(false);
+    zUpRelay(false);
+    DBG_PRINTLN(F("[MOVE_Z] Timeout waiting for target Z level, using fallback timed motion"));
+    return moveDown ? zDown_for(timeoutSec) : zUp_for(timeoutSec);
 }
 
 // ---------------- HTTP ----------------
@@ -1331,7 +1773,7 @@ void handleBathsList() {
     DBG_PRINTLN(F("[HTTP] GET /baths_list"));
 
     String out;
-    out.reserve(1024);
+    out.reserve(2048);
     out = "{\"count\":";
     out += String(dynamicBathCount);
     out += ",\"baths\":[";
@@ -1353,6 +1795,25 @@ void handleBathsList() {
 
         out += "\"isStart\":" + String(b.isStart ? "true" : "false") + ",";
         out += "\"isEnd\":"   + String(b.isEnd   ? "true" : "false");
+        out += "}";
+    }
+
+    out += "],\"service_points\":{";
+    out += "\"start\":{\"configured\":";
+    out += String(g_startPoint.configured ? "true" : "false");
+    out += ",\"uid_hex\":\"";
+    out += (g_startPoint.configured ? uidToHexString(g_startPoint.uid, g_startPoint.uidLen) : "");
+    out += "\"},\"end\":{\"configured\":";
+    out += String(g_endPoint.configured ? "true" : "false");
+    out += ",\"uid_hex\":\"";
+    out += (g_endPoint.configured ? uidToHexString(g_endPoint.uid, g_endPoint.uidLen) : "");
+    out += "\"}},\"z_tags\":[";
+
+    for (size_t i = 0; i < g_zTags.size(); ++i) {
+        if (i > 0) out += ",";
+        out += "{";
+        out += "\"level\":" + String(g_zTags[i].level) + ",";
+        out += "\"uid_hex\":\"" + uidToHexString(g_zTags[i].uid, g_zTags[i].uidLen) + "\"";
         out += "}";
     }
 
@@ -1390,12 +1851,87 @@ void handleBathsUpdate() {
 
         BathInfo &b = g_baths[idx];
         b.bathNumber = v["bathNumber"] | b.bathNumber;
-        b.isStart    = v["isStart"]    | b.isStart;
-        b.isEnd      = v["isEnd"]      | b.isEnd;
+        b.isStart = false;
+        b.isEnd = false;
     }
 
     saveBathListToNVS();
     server.send(200, "text/plain", "OK");
+}
+
+void handleServicePointLearn() {
+    DBG_PRINTLN(F("[HTTP] POST /service_point_learn"));
+    if (!server.hasArg("kind")) {
+        server.send(400, "text/plain", "kind required");
+        return;
+    }
+
+    String kind = server.arg("kind");
+    ServicePointInfo *target = nullptr;
+    if (kind == "start") target = &g_startPoint;
+    if (kind == "end") target = &g_endPoint;
+    if (!target) {
+        server.send(400, "text/plain", "kind must be start or end");
+        return;
+    }
+
+    uint8_t uid[7] = {0};
+    uint8_t uidLen = 0;
+    uint32_t t0 = millis();
+    while (millis() - t0 < 5000UL) {
+        if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen)) {
+            setServicePoint(*target, uid, uidLen);
+            saveServicePointToNVS(kind == "start" ? NVS_KEY_START_POINT : NVS_KEY_END_POINT, *target);
+            noteLastDetected(kind == "start" ? LDK_START : LDK_END, -1, uid, uidLen);
+
+            String resp = "{\"ok\":true,\"kind\":\"" + kind + "\",\"uid_hex\":\"" + uidToHexString(uid, uidLen) + "\"}";
+            server.send(200, "application/json", resp);
+            return;
+        }
+        delay(50);
+    }
+
+    server.send(408, "application/json", "{\"ok\":false,\"error\":\"timeout: tag not detected\"}");
+}
+
+void handleZTagLearn() {
+    DBG_PRINTLN(F("[HTTP] POST /z_tag_learn"));
+    if (!server.hasArg("level")) {
+        server.send(400, "text/plain", "level required");
+        return;
+    }
+
+    int16_t level = (int16_t)server.arg("level").toInt();
+    uint8_t uid[7] = {0};
+    uint8_t uidLen = 0;
+    uint32_t t0 = millis();
+    while (millis() - t0 < 5000UL) {
+        if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen)) {
+            int existingIdx = findZTagIndexByLevel(level);
+            ZTagInfo z{};
+            z.level = level;
+            z.uidLen = uidLen > 7 ? 7 : uidLen;
+            memcpy(z.uid, uid, z.uidLen);
+
+            if (existingIdx >= 0) g_zTags[existingIdx] = z;
+            else if ((int)g_zTags.size() < MAX_BATHS_LIMIT) g_zTags.push_back(z);
+
+            saveZTagsToNVS();
+            g_currentZLevel = level;
+            noteLastDetected(LDK_Z_LEVEL, level, uid, uidLen);
+
+            String resp = "{\"ok\":true,\"level\":";
+            resp += String(level);
+            resp += ",\"uid_hex\":\"";
+            resp += uidToHexString(uid, uidLen);
+            resp += "\"}";
+            server.send(200, "application/json", resp);
+            return;
+        }
+        delay(50);
+    }
+
+    server.send(408, "application/json", "{\"ok\":false,\"error\":\"timeout: tag not detected\"}");
 }
 void handleBathsLearn() {
     DBG_PRINTLN(F("[HTTP] POST /baths_learn"));
@@ -1416,10 +1952,10 @@ void handleBathsLearn() {
     // при необходимости расширяем g_baths
     while (idx >= (int)g_baths.size() && (int)g_baths.size() < MAX_BATHS_LIMIT) {
         BathInfo b{};
-        b.bathNumber = (uint16_t)g_baths.size();
+        b.bathNumber = (uint16_t)(g_baths.size() + 1);
         b.uidLen     = 0;
         memset(b.uid, 0, sizeof(b.uid));
-        b.isStart = (g_baths.empty());  // первую можно считать стартовой
+        b.isStart = false;
         b.isEnd   = false;
         g_baths.push_back(b);
         dynamicBathCount = (int)g_baths.size();
@@ -1543,9 +2079,11 @@ void handleRouteGet() {
         const Step &s = tmp[i];
         out += "{";
         out += "\"bath\":"     + String(s.bath)     + ",";
-        out += "\"z_down_s\":" + String(s.z_down_s) + ",";
+        out += "\"z_level_down\":" + String(s.z_level_down) + ",";
+        out += "\"z_down_timeout_s\":" + String(s.z_down_timeout_s) + ",";
         out += "\"hold_s\":"   + String(s.hold_s)   + ",";
-        out += "\"z_up_s\":"   + String(s.z_up_s)   + ",";
+        out += "\"z_level_up\":" + String(s.z_level_up) + ",";
+        out += "\"z_up_timeout_s\":" + String(s.z_up_timeout_s) + ",";
         out += "\"dry_s\":"    + String(s.dry_s)    + ",";
         out += "\"spin\":"     + String((bool)(s.flags & 1) ? "true" : "false") + ",";
         out += "\"fan\":"      + String((bool)(s.flags & 2) ? "true" : "false");
@@ -1599,9 +2137,11 @@ void handleRouteSaveLib() {
         JsonObject v = arr[i].as<JsonObject>();
         Step s{};
         s.bath      = v["bath"]      | 0;
-        s.z_down_s  = v["z_down_s"]  | 3;
+        s.z_level_down = v["z_level_down"] | 0;
+        s.z_down_timeout_s = v["z_down_timeout_s"] | (uint16_t)(v["z_down_s"] | 3);
         s.hold_s    = v["hold_s"]    | 0;
-        s.z_up_s    = v["z_up_s"]    | 3;
+        s.z_level_up = v["z_level_up"] | 0;
+        s.z_up_timeout_s = v["z_up_timeout_s"] | (uint16_t)(v["z_up_s"] | 3);
         s.dry_s     = v["dry_s"]     | 5;
         bool spin   = v["spin"]      | false;
         bool fan    = v["fan"]       | false;
@@ -1678,35 +2218,61 @@ void uidToHex(const uint8_t* uid, uint8_t len, char* out) {
     *p = '\0';
 }
 void handleStatus() {
-    StaticJsonDocument<1024> doc;
+    StaticJsonDocument<6144> doc;
 
     doc["state"] = g_state;
     doc["state_str"] = stateToString(g_state);
+    doc["time"] = rtcTimeString();
+    doc["date"] = rtcDateString();
+    doc["bath"] = g_currentBath;
+    doc["z_level"] = g_currentZLevel;
+    doc["step_idx"] = g_stepIdx;
+    doc["steps"] = g_routeSteps;
+    doc["active_route"] = getActiveRouteId();
 
     // Количество ванн в текущей калибровке
     doc["learn_count"] = dynamicBathCount;
 
-    // Последняя найденная ванна (обновляется в процессе автообучения)
-    if (dynamicBathCount > 0) {
-        auto &b = g_baths[dynamicBathCount - 1];
-        JsonObject last = doc.createNestedObject("last_found");
+    doc["start_configured"] = g_startPoint.configured;
+    doc["end_configured"] = g_endPoint.configured;
 
-        last["index"] = b.bathNumber;
-        last["isStart"] = b.isStart;
-        last["isEnd"]   = b.isEnd;
+    JsonObject sp = doc.createNestedObject("service_points");
+    JsonObject spStart = sp.createNestedObject("start");
+    spStart["configured"] = g_startPoint.configured;
+    spStart["uid"] = g_startPoint.configured ? uidToHexString(g_startPoint.uid, g_startPoint.uidLen) : "";
+    JsonObject spEnd = sp.createNestedObject("end");
+    spEnd["configured"] = g_endPoint.configured;
+    spEnd["uid"] = g_endPoint.configured ? uidToHexString(g_endPoint.uid, g_endPoint.uidLen) : "";
 
-        char uidBuf[32];
-        uidToHex(b.uid, b.uidLen, uidBuf);
-        last["uid"] = uidBuf;
+    JsonArray zTags = doc.createNestedArray("z_tags");
+    for (const auto &z : g_zTags) {
+        JsonObject zo = zTags.createNestedObject();
+        zo["level"] = z.level;
+        zo["uid"] = uidToHexString(z.uid, z.uidLen);
     }
 
-    // Вся таблица ванн (старая + текущая)
+    // Последняя найденная точка/уровень
+    if (g_lastDetected.kind != LDK_NONE) {
+        JsonObject last = doc.createNestedObject("last_found");
+        last["kind"] = g_lastDetected.kind;
+        last["kind_str"] =
+            g_lastDetected.kind == LDK_START ? "start" :
+            g_lastDetected.kind == LDK_END ? "end" :
+            g_lastDetected.kind == LDK_Z_LEVEL ? "z_level" : "process";
+        last["index"] = g_lastDetected.number;
+        last["isStart"] = g_lastDetected.kind == LDK_START;
+        last["isEnd"]   = g_lastDetected.kind == LDK_END;
+        last["uid"] = uidToHexString(g_lastDetected.uid, g_lastDetected.uidLen);
+    }
+
+    // Вся таблица рабочих ванн
     JsonArray arr = doc.createNestedArray("baths");
     for (auto &b : g_baths) {
         JsonObject o = arr.createNestedObject();
         o["index"] = b.bathNumber;
         o["isStart"] = b.isStart;
         o["isEnd"] = b.isEnd;
+        o["kind"] = "process";
 
         char uidBuf[32];
         uidToHex(b.uid, b.uidLen, uidBuf);
@@ -1718,16 +2284,29 @@ void handleStatus() {
     server.send(200, "application/json", out);
 }
 
+bool activeRouteIsExecutable() {
+    if (g_routeSteps == 0) return false;
+    if (!g_startPoint.configured) return false;
+
+    for (uint16_t i = 0; i < g_routeSteps; ++i) {
+        if (findBathStorageIndexByNumber(g_route[i].bath) < 0) {
+            DBG_PRINTF("[ROUTE] Step %u references missing bathNumber=%u\r\n",
+                       (unsigned)i, g_route[i].bath);
+            return false;
+        }
+    }
+    return true;
+}
 
 void handleStart() {
     DBG_PRINTLN(F("[HTTP] POST /start"));
-    if (g_state == PS_IDLE && g_routeSteps > 0) {
+    if (g_state == PS_IDLE && activeRouteIsExecutable()) {
         g_startCommand = true;
         DBG_PRINTLN(F("[HTTP]   startCommand set"));
         server.send(200, "text/plain", "OK");
     } else {
-        DBG_PRINTLN(F("[HTTP]   BUSY or no recipe"));
-        server.send(409, "text/plain", "BUSY or no recipe");
+        DBG_PRINTLN(F("[HTTP]   BUSY or route config invalid"));
+        server.send(409, "text/plain", "BUSY or invalid route/start config");
     }
 }
 
@@ -1770,9 +2349,11 @@ void handleRoutePost() {
         JsonObject v = arr[i].as<JsonObject>();
         Step s{};
         s.bath      = v["bath"]      | 0;
-        s.z_down_s  = v["z_down_s"]  | 3;
+        s.z_level_down = v["z_level_down"] | 0;
+        s.z_down_timeout_s = v["z_down_timeout_s"] | (uint16_t)(v["z_down_s"] | 3);
         s.hold_s    = v["hold_s"]    | 0;
-        s.z_up_s    = v["z_up_s"]    | 3;
+        s.z_level_up = v["z_level_up"] | 0;
+        s.z_up_timeout_s = v["z_up_timeout_s"] | (uint16_t)(v["z_up_s"] | 3);
         s.dry_s     = v["dry_s"]     | 5;
         bool spin   = v["spin_on"]   | false;
         bool fan    = v["fan_on"]    | false;
@@ -1793,12 +2374,13 @@ void handleBathHistory() {
         server.send(400,"text/plain","bath param required");
         return;
     }
-    int b = server.arg("bath").toInt();
-    DBG_PRINTF("[HTTP]   bath=%d\r\n", b);
-    if (b < 0 || b >= dynamicBathCount) {
-    server.send(400, "text/plain", "invalid bath");
-    return;
-}
+    int requestedBath = server.arg("bath").toInt();
+    DBG_PRINTF("[HTTP]   bath=%d\r\n", requestedBath);
+    int b = findBathStorageIndexByNumber((uint16_t)requestedBath);
+    if (b < 0) {
+        server.send(400, "text/plain", "invalid bath");
+        return;
+    }
     String out;
     out.reserve(2048);
     out = "[";
@@ -1832,7 +2414,7 @@ void handleBathData() {
     for(int i=0;i<N;i++){
         if(i>0) out += ",";
         out += "{";
-        out += "\"id\":" + String(i) + ",";
+        out += "\"id\":" + String(g_baths[i].bathNumber) + ",";
         out += "\"temp\":" + String(25.0 + i*0.3) + ",";
         out += "\"ph\":" + String(7.0 + i*0.01) + ",";
         out += "\"orp\":" + String(500 + i*3) + ",";
@@ -1865,7 +2447,7 @@ void TaskProcess(void* pv) {
     (void)pv;
     DBG_PRINTLN(F("[TASK] TaskProcess started"));
     for (;;) {
-        g_currentBath = bathIndex;
+        g_currentBath = getBathDisplayNumberByIndex(bathIndex);
 
         // История ванн (пока синтетика, раз в 3 секунды)
         static uint32_t lastHist = 0;
@@ -1906,15 +2488,14 @@ void TaskProcess(void* pv) {
             break;
 
         case PS_HOMING: {
-            DBG_PRINTLN(F("[FSM] HOMING (go to bath 0 by RFID)"));
+            DBG_PRINTLN(F("[FSM] HOMING (go to start point by RFID)"));
 
-            // Едем к ванне 0, считая метку RFID
-            bool ok = moveToBath(0, 30000);
+            // Едем к стартовой точке линии, считая метку RFID
+            bool ok = moveToStartPoint(30000);
 
             if (ok) {
-                DBG_PRINTLN(F("[FSM] HOMING success, bathIndex=0"));
-                bathIndex     = 0;
-                g_currentBath = 0;
+                DBG_PRINTLN(F("[FSM] HOMING success"));
+                g_currentBath = getBathDisplayNumberByIndex(bathIndex);
                 g_stepIdx     = 0;
                 setState(PS_MOVE_X, "Homing completed");
             } else {
@@ -1925,44 +2506,22 @@ void TaskProcess(void* pv) {
 case PS_LEARN_BATHS: {
     DBG_PRINTLN("[LEARN] START auto learn baths");
 
-    // --- 0. Найти стартовую и конечную ванну в старом списке ---
-    uint8_t startUid[7] = {0};
-    uint8_t endUid[7]   = {0};
-    uint8_t startLen = 0, endLen = 0;
-
-    for (auto &b : g_baths) {
-        if (b.isStart) {
-            memcpy(startUid, b.uid, b.uidLen);
-            startLen = b.uidLen;
-        }
-        if (b.isEnd) {
-            memcpy(endUid, b.uid, b.uidLen);
-            endLen = b.uidLen;
-        }
-    }
-
-    if (startLen == 0 || endLen == 0) {
-        DBG_PRINTLN("[LEARN] ERROR: start or end UID not set");
-        setState(PS_ERROR, "No start/end UID");
+    if (!g_startPoint.configured || !g_endPoint.configured) {
+        DBG_PRINTLN("[LEARN] ERROR: start or end service point not set");
+        setState(PS_ERROR, "No start/end service point");
         break;
     }
-
-    DBG_PRINT("[LEARN] START UID: ");
-    for (int i=0; i<startLen; i++) DBG_PRINTF("%02X ", startUid[i]);
-    DBG_PRINTLN("");
-
-    DBG_PRINT("[LEARN] END UID:   ");
-    for (int i=0; i<endLen; i++) DBG_PRINTF("%02X ", endUid[i]);
-    DBG_PRINTLN("");
 
     // --- 1. Очистить таблицу ---
     g_baths.clear();
     dynamicBathCount = 0;
+    noteLastDetected(LDK_NONE, -1, nullptr, 0);
 
     // --- 2. Подготовка переменных ---
     uint8_t lastUid[7] = {0};
     uint8_t lastLen = 0;
     int stable = 0;
+    bool startSeen = false;
 
     // --- 3. Начать движение ---
     xRev(false);
@@ -1995,63 +2554,65 @@ case PS_LEARN_BATHS: {
             }
 
             if (stable >= 2) {
+                if (servicePointMatches(g_startPoint, uid, uidLen)) {
+                    startSeen = true;
+                    noteLastDetected(LDK_START, -1, uid, uidLen);
+                    oledShowLearn(dynamicBathCount, uid, uidLen);
+                    vTaskDelay(80 / portTICK_PERIOD_MS);
+                    continue;
+                }
 
-                // проверяем — новая ли это ванна
+                if (servicePointMatches(g_endPoint, uid, uidLen)) {
+                    noteLastDetected(LDK_END, -1, uid, uidLen);
+                    oledShowLearn(dynamicBathCount, uid, uidLen);
+                    DBG_PRINTLN("[LEARN] END service point detected!");
+                    xFwd(false);
+                    goto LEARN_DONE;
+                }
+
+                if (!startSeen) {
+                    // До стартовой точки не считаем рабочие ванны.
+                    vTaskDelay(80 / portTICK_PERIOD_MS);
+                    continue;
+                }
+
+                // проверяем — новая ли это рабочая ванна
                 int idx = findBathIndexByUID(uid, uidLen);
                 if (idx < 0) {
                     BathInfo b{};
-                    b.bathNumber = dynamicBathCount;
+                    b.bathNumber = dynamicBathCount + 1;
                     b.uidLen = uidLen;
                     memcpy(b.uid, uid, uidLen);
-
-                    // стартовая — та, чья метка совпадает с сохранённым START UID
-                    b.isStart = (uidLen == startLen && uidEquals(uid, startUid, uidLen));
+                    b.isStart = false;
                     b.isEnd   = false;
 
                     g_baths.push_back(b);
                     dynamicBathCount++;
+                    noteLastDetected(LDK_PROCESS, b.bathNumber, uid, uidLen);
 
                     DBG_PRINTF("[LEARN] NEW BATH %d — UID: ", b.bathNumber);
                     for (int i=0;i<uidLen;i++) DBG_PRINTF("%02X ", uid[i]);
                     DBG_PRINTLN("");
+                } else {
+                    noteLastDetected(LDK_PROCESS, g_baths[idx].bathNumber, uid, uidLen);
                 }
 
                 // показать на OLED
                 oledShowLearn(dynamicBathCount, uid, uidLen);
-
-                // --- ПРОВЕРКА КОНЕЧНОЙ ВАННЫ ---
-                if (uidLen == endLen && uidEquals(uid, endUid, uidLen)) {
-                    DBG_PRINTLN("[LEARN] END bath detected!");
-                    xFwd(false);
-                    goto LEARN_DONE;
-                }
             }
         }
 
         vTaskDelay(20 / portTICK_PERIOD_MS);
     }
 
-    // fallback: последняя ванна = конечная
-    if (!g_baths.empty()) {
-        g_baths.back().isEnd = true;
-    }
-
 LEARN_DONE:
 
     DBG_PRINTLN("[LEARN] Learning finished, saving...");
 
-    // Помечаем конечную ванну корректно
-    for (auto &b : g_baths) {
-        if (b.uidLen == endLen && uidEquals(b.uid, endUid, endLen)) {
-            b.isEnd = true;
-            break;
-        }
-    }
-
     saveBathListToNVS();
 
     DBG_PRINTLN("[LEARN] Returning Home...");
-    moveToBath(0, 30000);
+    moveToStartPoint(30000);
 
     setState(PS_IDLE, "Learn done");
     break;
@@ -2067,14 +2628,14 @@ break;
                 }
                 Step &st = g_route[g_stepIdx];
                 DBG_PRINTF("[FSM]   target bath=%u\r\n", st.bath);
-                bool ok = moveToBath(st.bath, 30000);
+                bool ok = moveToBathNumber(st.bath, 30000);
                 setState(ok ? PS_LOWER_Z : PS_ERROR, ok ? "moveToBath OK" : "moveToBath FAIL");
             } break;
 
             case PS_LOWER_Z: {
                 DBG_PRINTF("[FSM] LOWER_Z, stepIdx=%d\r\n", (int)g_stepIdx);
                 Step &st = g_route[g_stepIdx];
-                bool ok = zDown_for(st.z_down_s);
+                bool ok = moveZToLevel((int16_t)st.z_level_down, true, st.z_down_timeout_s);
                 setState(ok ? PS_HOLD : PS_ERROR, ok ? "zDown OK" : "zDown FAIL");
             } break;
 
@@ -2104,7 +2665,7 @@ break;
             case PS_RAISE_Z: {
                 DBG_PRINTF("[FSM] RAISE_Z, stepIdx=%d\r\n", (int)g_stepIdx);
                 Step &st = g_route[g_stepIdx];
-                bool ok = zUp_for(st.z_up_s);
+                bool ok = moveZToLevel((int16_t)st.z_level_up, false, st.z_up_timeout_s);
                 setState(ok ? PS_DRY : PS_ERROR, ok ? "zUp OK" : "zUp FAIL");
             } break;
 
@@ -2144,7 +2705,7 @@ break;
 
             case PS_RETURN_HOME: {
                 DBG_PRINTLN(F("[FSM] RETURN_HOME"));
-                bool ok = moveToBath(0, 30000);
+                bool ok = moveToStartPoint(30000);
                 relOffAll();
                 setState(ok ? PS_IDLE : PS_ERROR, ok ? "Return OK" : "Return FAIL");
             } break;
@@ -2198,7 +2759,7 @@ else {
     if (g_state == PS_IDLE) {
         oledShowIdle();
 
-        if (startButtonPressed() && g_routeSteps > 0) {
+        if (startButtonPressed() && activeRouteIsExecutable()) {
             g_startCommand = true;
         }
 
@@ -2250,16 +2811,20 @@ void setup() {
        // Инициализация таблиц
     initBathTables();          // очистка истории и g_baths (пусто)
     loadBathListFromNVS();     // загрузка ванн из NVS
+    loadServicePointFromNVS(NVS_KEY_START_POINT, g_startPoint);
+    loadServicePointFromNVS(NVS_KEY_END_POINT, g_endPoint);
+    loadZTagsFromNVS();
+    migrateLegacyServiceFlagsIfNeeded();
 
     // Если хочешь гарантированный минимум "логических" ванн – можно создать пустые слоты
     if (dynamicBathCount < MIN_BATHS) {
         for (int i = dynamicBathCount; i < MIN_BATHS; ++i) {
             if ((int)g_baths.size() >= MAX_BATHS_LIMIT) break;
             BathInfo b;
-            b.bathNumber = (uint16_t)i;
+            b.bathNumber = (uint16_t)(i + 1);
             b.uidLen     = 0;
             memset(b.uid, 0, sizeof(b.uid));
-            b.isStart = (i == 0);                 // можно сразу пометить нулевую как старт
+            b.isStart = false;
             b.isEnd   = false;
             g_baths.push_back(b);
         }
@@ -2319,9 +2884,9 @@ void setup() {
     if (!loadRouteSlot(0)) {
         DBG_PRINTLN(F("[SETUP] slot 0 empty, create demo route"));
         Step demo[3];
-        demo[0] = { 1, 4, 3, 3, 5, 1 }; // ванна 1, 4с выдержка, крутилка
-        demo[1] = { 2, 5, 3, 3, 6, 0 }; // ванна 2, без вращения/фена
-        demo[2] = { 1, 3, 3, 3, 4, 2 }; // ванна 1, только фен
+        demo[0] = { 1, 1, 3, 4, 0, 3, 5, 1 };
+        demo[1] = { 2, 1, 3, 5, 0, 3, 6, 0 };
+        demo[2] = { 1, 1, 3, 3, 0, 3, 4, 2 };
 
         saveRouteSlot(0, demo, 3);
         memcpy(g_route, demo, sizeof(demo));
@@ -2367,6 +2932,8 @@ server.on("/baths_list", HTTP_GET, handleBathsList);
 server.on("/baths_update", HTTP_POST, handleBathsUpdate);
 server.on("/baths_learn", HTTP_POST, handleBathsLearn);
 server.on("/baths_autolearn", HTTP_POST, handleBathsAutoLearn);
+server.on("/service_point_learn", HTTP_POST, handleServicePointLearn);
+server.on("/z_tag_learn", HTTP_POST, handleZTagLearn);
 
 // ============================
 //    *** UI ROUTES ***

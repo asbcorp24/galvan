@@ -4,38 +4,70 @@
 
 const char WEB_BATHS_CONTENT[] PROGMEM = R"rawliteral(
 <section class="card">
-        <h2><span class="dot"></span> Ванны и их RFID-метки</h2>
-        <p style="font-size:.8rem;color:#8b93af;margin-top:0;">
-            Нажмите «Считать метку» → поднесите карту/метку к считывателю PN532. UID запишется в выбранную ванну.
-        </p>
+    <h2><span class="dot"></span> Рабочие ванны и RFID</h2>
+    <p style="font-size:.8rem;color:#8b93af;margin-top:0;">
+        Здесь задаются только рабочие ванны для рецептов. Служебные точки линии <b>Start</b> и <b>End</b>
+        обучаются отдельно, а RFID уровни Z используются для вертикального позиционирования подъёмника.
+    </p>
 
-        <div style="overflow-x:auto;">
-            <table id="bathsTable">
-                <thead>
-                <tr>
-                    <th>#</th>
-                    <th>Логический номер</th>
-                    <th>UID RFID</th>
-                    <th>Старт</th>
-                    <th>Финиш</th>
-                    <th>Действия</th>
-                </tr>
-                </thead>
-                <tbody></tbody>
-            </table>
-        </div>
-
-        <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:8px;">
-            <button class="secondary" id="btnReload">⟳ Обновить список</button>
-            <button class="primary" id="btnSave">💾 Сохранить флаги</button>
-        </div>
-
-        <div id="bathMsg" class="msg"></div>
-    </section>
-
-    <div class="footer">
-        GalvaControl · RFID → ванна · ESP32 + PN532
+    <div class="row" style="margin-bottom:10px;">
+        <div class="pill-soft">Start: <span id="startUidLabel">—</span></div>
+        <div class="pill-soft">End: <span id="endUidLabel">—</span></div>
+        <div class="pill-soft">Текущий Z: <span id="currentZLabel">—</span></div>
     </div>
+
+    <div class="btn-row" style="margin-bottom:12px;">
+        <button class="secondary" id="btnLearnStart">📍 Считать Start</button>
+        <button class="secondary" id="btnLearnEnd">🏁 Считать End</button>
+    </div>
+
+    <div style="overflow-x:auto;">
+        <table id="bathsTable">
+            <thead>
+            <tr>
+                <th>#</th>
+                <th>Логический номер</th>
+                <th>UID RFID</th>
+                <th>Действия</th>
+            </tr>
+            </thead>
+            <tbody></tbody>
+        </table>
+    </div>
+
+    <div class="btn-row" style="margin-top:8px;">
+        <button class="secondary" id="btnReload">🟳 Обновить список</button>
+        <button class="primary" id="btnSave">💾 Сохранить ванны</button>
+    </div>
+
+    <h3 style="margin-top:18px;">RFID уровни Z</h3>
+    <div class="row">
+        <div>
+            <div class="label">Номер уровня</div>
+            <input type="number" id="zLevelInput" min="0" max="32767" value="0">
+        </div>
+        <div style="display:flex;align-items:flex-end;">
+            <button class="secondary" id="btnLearnZ">↕ Считать Z-метку</button>
+        </div>
+    </div>
+
+    <div style="overflow-x:auto; margin-top:8px;">
+        <table id="zTagsTable">
+            <thead>
+            <tr>
+                <th>Уровень</th>
+                <th>UID RFID</th>
+            </tr>
+            </thead>
+            <tbody></tbody>
+        </table>
+    </div>
+
+    <div id="bathMsg" class="msg"></div>
+</section>
+
+<div class="footer">
+    GalvaControl · RFID line points + process baths + Z levels
 </div>
 
 <script>
@@ -53,43 +85,54 @@ function uidToLabel(uidHex) {
 }
 
 async function loadBaths() {
-    setMsg(null, "Загрузка списка ванн...");
+    setMsg(null, "Загрузка конфигурации RFID...");
     const tbody = el("bathsTable").querySelector("tbody");
+    const zTbody = el("zTagsTable").querySelector("tbody");
     tbody.innerHTML = "";
+    zTbody.innerHTML = "";
+
     try {
         const res = await fetch("/baths_list");
         if (!res.ok) throw new Error("HTTP " + res.status);
         const data = await res.json();
 
+        el("startUidLabel").textContent = uidToLabel(data.service_points?.start?.uid_hex);
+        el("endUidLabel").textContent = uidToLabel(data.service_points?.end?.uid_hex);
+
         if (!data.baths || !data.baths.length) {
             const tr = document.createElement("tr");
-            const td = document.createElement("td");
-            td.colSpan = 6;
-            td.textContent = "Ванны не инициализированы";
-            tr.appendChild(td);
+            tr.innerHTML = `<td colspan="4">Рабочие ванны пока не заданы</td>`;
             tbody.appendChild(tr);
         } else {
             data.baths.forEach((b, idx) => {
                 const tr = document.createElement("tr");
                 tr.dataset.index = b.index;
-
                 tr.innerHTML = `
-                    <td>${idx+1}</td>
-                    <td>
-                        <input type="number" min="0" max="65535" value="${b.bathNumber}">
-                    </td>
+                    <td>${idx + 1}</td>
+                    <td><input type="number" min="0" max="65535" value="${b.bathNumber}"></td>
                     <td class="uid-cell">${uidToLabel(b.uid_hex)}</td>
-                    <td><input type="checkbox" class="chk-start" ${b.isStart ? "checked" : ""}></td>
-                    <td><input type="checkbox" class="chk-end" ${b.isEnd ? "checked" : ""}></td>
-                    <td>
-                        <button class="secondary btn-learn">📡 Считать метку</button>
-                    </td>
+                    <td><button class="secondary btn-learn">📡 Считать метку</button></td>
                 `;
                 tbody.appendChild(tr);
             });
         }
 
-        setMsg(true, "Список ванн загружен");
+        if (!data.z_tags || !data.z_tags.length) {
+            const tr = document.createElement("tr");
+            tr.innerHTML = `<td colspan="2">Z-уровни ещё не обучены</td>`;
+            zTbody.appendChild(tr);
+        } else {
+            data.z_tags.forEach(z => {
+                const tr = document.createElement("tr");
+                tr.innerHTML = `
+                    <td>${z.level}</td>
+                    <td>${uidToLabel(z.uid_hex)}</td>
+                `;
+                zTbody.appendChild(tr);
+            });
+        }
+
+        setMsg(true, "Конфигурация RFID загружена");
     } catch (e) {
         console.error(e);
         setMsg(false, "Ошибка загрузки: " + e.message);
@@ -99,7 +142,7 @@ async function loadBaths() {
 async function learnTagForRow(tr) {
     const idx = parseInt(tr.dataset.index, 10);
     if (isNaN(idx)) return;
-    setMsg(null, "Считывание метки для ванны #" + idx + "... Поднесите карту к PN532.");
+    setMsg(null, "Считывание метки для рабочей ванны #" + idx + "...");
 
     try {
         const res = await fetch("/baths_learn?index=" + encodeURIComponent(idx), {method: "POST"});
@@ -109,35 +152,29 @@ async function learnTagForRow(tr) {
         const data = JSON.parse(txt);
         if (!data.ok) throw new Error(data.error || "Неизвестная ошибка");
 
-        const cell = tr.querySelector(".uid-cell");
-        cell.textContent = uidToLabel(data.uid_hex);
-        setMsg(true, "UID записан для ванны #" + idx);
+        tr.querySelector(".uid-cell").textContent = uidToLabel(data.uid_hex);
+        setMsg(true, "UID записан для рабочей ванны #" + idx);
     } catch (e) {
         console.error(e);
         setMsg(false, "Ошибка считывания: " + e.message);
     }
 }
 
-async function saveBathFlags() {
+async function saveBaths() {
     const rows = Array.from(el("bathsTable").querySelectorAll("tbody tr"));
-    if (!rows.length) return;
-
     const payload = { baths: [] };
+
     rows.forEach(tr => {
         const idx = parseInt(tr.dataset.index, 10);
         if (isNaN(idx)) return;
         const num = tr.querySelector("input[type='number']").value;
-        const isStart = tr.querySelector(".chk-start").checked;
-        const isEnd = tr.querySelector(".chk-end").checked;
         payload.baths.push({
             index: idx,
-            bathNumber: parseInt(num || "0", 10),
-            isStart: isStart,
-            isEnd: isEnd
+            bathNumber: parseInt(num || "0", 10)
         });
     });
 
-    setMsg(null, "Сохранение параметров ванн...");
+    setMsg(null, "Сохранение рабочих ванн...");
     try {
         const res = await fetch("/baths_update", {
             method: "POST",
@@ -146,7 +183,7 @@ async function saveBathFlags() {
         });
         const txt = await res.text();
         if (!res.ok) throw new Error(txt || ("HTTP " + res.status));
-        setMsg(true, "Параметры ванн сохранены");
+        setMsg(true, "Рабочие ванны сохранены");
         loadBaths();
     } catch (e) {
         console.error(e);
@@ -154,9 +191,52 @@ async function saveBathFlags() {
     }
 }
 
+async function learnServicePoint(kind) {
+    setMsg(null, "Считывание " + kind + " метки...");
+    try {
+        const res = await fetch("/service_point_learn?kind=" + encodeURIComponent(kind), {method: "POST"});
+        const txt = await res.text();
+        if (!res.ok) throw new Error(txt || ("HTTP " + res.status));
+        JSON.parse(txt);
+        setMsg(true, "Служебная точка " + kind + " сохранена");
+        await loadBaths();
+    } catch (e) {
+        console.error(e);
+        setMsg(false, "Ошибка обучения служебной точки: " + e.message);
+    }
+}
+
+async function learnZTag() {
+    const level = parseInt(el("zLevelInput").value || "0", 10);
+    setMsg(null, "Считывание Z-метки уровня " + level + "...");
+    try {
+        const res = await fetch("/z_tag_learn?level=" + encodeURIComponent(level), {method: "POST"});
+        const txt = await res.text();
+        if (!res.ok) throw new Error(txt || ("HTTP " + res.status));
+        const data = JSON.parse(txt);
+        setMsg(true, "Z-уровень " + data.level + " сохранён");
+        await loadBaths();
+    } catch (e) {
+        console.error(e);
+        setMsg(false, "Ошибка обучения Z-уровня: " + e.message);
+    }
+}
+
+async function refreshStatus() {
+    try {
+        const res = await fetch("/status");
+        if (!res.ok) return;
+        const st = await res.json();
+        el("currentZLabel").textContent = (st.z_level != null && st.z_level >= 0) ? st.z_level : "—";
+    } catch (_) {}
+}
+
 document.addEventListener("DOMContentLoaded", () => {
     el("btnReload").addEventListener("click", loadBaths);
-    el("btnSave").addEventListener("click", saveBathFlags);
+    el("btnSave").addEventListener("click", saveBaths);
+    el("btnLearnStart").addEventListener("click", () => learnServicePoint("start"));
+    el("btnLearnEnd").addEventListener("click", () => learnServicePoint("end"));
+    el("btnLearnZ").addEventListener("click", learnZTag);
 
     el("bathsTable").addEventListener("click", (e) => {
         const btn = e.target.closest(".btn-learn");
@@ -167,6 +247,8 @@ document.addEventListener("DOMContentLoaded", () => {
     });
 
     loadBaths();
+    refreshStatus();
+    setInterval(refreshStatus, 1000);
 });
 </script>
 )rawliteral";
