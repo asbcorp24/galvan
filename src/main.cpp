@@ -69,6 +69,7 @@
 #define SW_Z_TOP     14
 #define SW_Z_BOTTOM  13
 
+#define PN532_IRQ   25   // для I2C-конструктора библиотеки; может быть не подключен физически
 #define PN532_RESET 27
 // Аварийный стоп
 #define PIN_ESTOP  26
@@ -257,8 +258,8 @@ volatile int16_t bathIndex = 0;
 volatile bool    dirRight  = true;
 
 
-// PN532 работает по I2C, поэтому IRQ не используем и не конфликтуем с концевиком Z.
-Adafruit_PN532 nfc(&Wire);
+// PN532 работает по I2C. Библиотека требует irq/reset в конструкторе, даже если IRQ не используется логикой.
+Adafruit_PN532 nfc(PN532_IRQ, PN532_RESET, &Wire);
 
 
 
@@ -628,6 +629,7 @@ void setState(ProcState newState, const char* reason);
 
 // Прототип функции привязки RFID-метки к новой ванне
 void assignNewBathTag(uint8_t uid[], uint8_t uidLen);
+bool decodeRouteBytes(const void *raw, size_t haveBytes, uint16_t stepCount, Step *dst);
 
 // ---------------- БИБЛИОТЕКА РЕЦЕПТОВ В NVS ----------------
 // Индекс: ключ "routes" (строка CSV вида "1,2,5")
