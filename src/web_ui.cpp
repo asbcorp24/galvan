@@ -304,6 +304,54 @@ const char WEB_UI_INDEX[] PROGMEM = R"rawliteral(
                 </div>
             </div>
 
+            <div class="row">
+                <div>
+                    <div class="label">Действие</div>
+                    <div class="value" id="stAction">–</div>
+                </div>
+                <div>
+                    <div class="label">Ожидает</div>
+                    <div class="value" id="stWaiting">–</div>
+                </div>
+            </div>
+
+            <div class="row">
+                <div>
+                    <div class="label">Цель по X</div>
+                    <div class="value" id="stTargetBath">–</div>
+                </div>
+                <div>
+                    <div class="label">Цель по Z</div>
+                    <div class="value" id="stTargetZ">–</div>
+                </div>
+                <div>
+                    <div class="label">Направление X</div>
+                    <div class="value" id="stDirX">–</div>
+                </div>
+            </div>
+
+            <div class="row">
+                <div>
+                    <div class="label">Реле</div>
+                    <div class="value" id="stRelays">–</div>
+                </div>
+            </div>
+
+            <div class="row">
+                <div>
+                    <div class="label">Вращение</div>
+                    <div class="value" id="stSpin">–</div>
+                </div>
+                <div>
+                    <div class="label">Сушка / вент.</div>
+                    <div class="value" id="stFan">–</div>
+                </div>
+                <div>
+                    <div class="label">RFID</div>
+                    <div class="value" id="stReaders">–</div>
+                </div>
+            </div>
+
             <div class="btn-row">
                 <button class="primary" id="btnStart">
                     <span class="icon">▶</span>
@@ -360,6 +408,16 @@ const char WEB_UI_INDEX[] PROGMEM = R"rawliteral(
         </section>
     </div>
 
+    <section class="card" style="margin-top:16px;">
+        <h2><span class="dot"></span> Журнал действий</h2>
+        <div class="row" style="margin-bottom:8px;">
+            <div class="value" style="font-size:.82rem;color:var(--muted);">
+                Последние события контроллера. Полный архив можно будет просматривать отдельно и выгружать в CSV.
+            </div>
+        </div>
+        <div id="liveLog" style="font-family:ui-monospace,Consolas,monospace;font-size:.78rem;line-height:1.45;max-height:220px;overflow:auto;background:rgba(255,255,255,0.02);border:1px solid var(--border);border-radius:12px;padding:10px;">Журнал пуст</div>
+    </section>
+
     <div class="footer">
         GalvaControl · ESP32 · магнитные метки · литий-полимерная гальваника
     </div>
@@ -368,6 +426,41 @@ const char WEB_UI_INDEX[] PROGMEM = R"rawliteral(
 <script>
 const el = id => document.getElementById(id);
 function setText(id, text) { el(id).textContent = text; }
+const LOG_DB_NAME = "galvacontrol_logs";
+const LOG_DB_VERSION = 1;
+const LOG_STORE = "events";
+const LOG_META = "meta";
+
+function openLogDb() {
+    return new Promise((resolve, reject) => {
+        const req = indexedDB.open(LOG_DB_NAME, LOG_DB_VERSION);
+        req.onupgradeneeded = () => {
+            const db = req.result;
+            if (!db.objectStoreNames.contains(LOG_STORE)) {
+                db.createObjectStore(LOG_STORE, { keyPath: "seq" });
+            }
+            if (!db.objectStoreNames.contains(LOG_META)) {
+                db.createObjectStore(LOG_META, { keyPath: "key" });
+            }
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+    });
+}
+
+async function saveLogsToBrowser(items) {
+    if (!Array.isArray(items) || !items.length) return;
+    const db = await openLogDb();
+    await new Promise((resolve, reject) => {
+        const tx = db.transaction([LOG_STORE, LOG_META], "readwrite");
+        const store = tx.objectStore(LOG_STORE);
+        items.forEach(item => store.put(item));
+        tx.objectStore(LOG_META).put({ key: "lastSync", value: new Date().toLocaleString() });
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+    });
+    db.close();
+}
 
 function formatState(stateCode) {
     const map = {
@@ -388,6 +481,45 @@ function showStatusMsg(ok, text) {
     setText("stLastStatus", text);
     const chip = el("stLastStatus").parentElement;
     chip.style.color = ok ? "#8fe7b7" : "#ffb4b4";
+}
+
+function boolLabel(v) {
+    return v ? "ON" : "OFF";
+}
+
+function joinActiveRelays(relays) {
+    if (!relays) return "–";
+    const out = [];
+    if (relays.x_fwd) out.push("X→");
+    if (relays.x_rev) out.push("X←");
+    if (relays.z_up) out.push("Z↑");
+    if (relays.z_down) out.push("Z↓");
+    if (relays.spin) out.push("вращение");
+    if (relays.fan) out.push("вентилятор");
+    return out.length ? out.join(", ") : "ничего";
+}
+
+async function fetchActionLog() {
+    try {
+        const res = await fetch("/action_log");
+        if (!res.ok) return;
+        const data = await res.json();
+        const logBox = el("liveLog");
+        const items = Array.isArray(data.items) ? data.items : [];
+        saveLogsToBrowser(items).catch(console.error);
+        if (!items.length) {
+            logBox.textContent = "Журнал пуст";
+            return;
+        }
+        const recent = items.slice(-20).reverse();
+        logBox.innerHTML = recent.map(item => {
+            const level = item.level ?? "info";
+            const prefix = level === "error" ? "ERR" : level === "warn" ? "WRN" : "INF";
+            return `<div>[${item.time}] ${prefix} / ${item.category}: ${item.message}</div>`;
+        }).join("");
+    } catch (e) {
+        console.error(e);
+    }
 }
 
 async function fetchStatus() {
@@ -411,6 +543,15 @@ async function fetchStatus() {
         const stepIdx = (data.step_idx == null || data.step_idx < 0) ? "–" : (data.step_idx + 1);
         setText("stStep", stepIdx);
         setText("stStepsTotal", "/ " + (data.steps ?? "–"));
+        setText("stAction", data.action ?? "–");
+        setText("stWaiting", data.waiting_for ?? "–");
+        setText("stTargetBath", (data.target_bath == null || data.target_bath < 0) ? "–" : data.target_bath);
+        setText("stTargetZ", (data.target_z_level == null || data.target_z_level < 0) ? "–" : data.target_z_level);
+        setText("stDirX", data.direction_x ?? "–");
+        setText("stRelays", joinActiveRelays(data.relays));
+        setText("stSpin", `${boolLabel(data.spin_active)}${data.spin_requested ? " (по шагу)" : ""}`);
+        setText("stFan", `${boolLabel(data.fan_active)}${data.fan_requested ? " (по шагу)" : ""}`);
+        setText("stReaders", `X:${boolLabel(data.x_reader_ready)} Z:${boolLabel(data.z_reader_ready)}`);
 
         if (data.temp_c != null) setText("stTemp", data.temp_c.toFixed(1) + " °C");
         if (data.ph != null) setText("stPh", data.ph.toFixed(2));
@@ -425,6 +566,7 @@ async function fetchStatus() {
         }
 
         showStatusMsg(true, "OK");
+        fetchActionLog();
     } catch (e) {
         console.error(e);
         showStatusMsg(false, "Ошибка запроса");
@@ -547,9 +689,11 @@ document.addEventListener("DOMContentLoaded", () => {
     });
 
     fetchStatus();
+    fetchActionLog();
     loadRoutesList();
 
     setInterval(fetchStatus, 3000);
+    setInterval(fetchActionLog, 3000);
 });
 </script>
 </body>

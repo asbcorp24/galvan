@@ -13,12 +13,16 @@ const char WEB_BATHS_CONTENT[] PROGMEM = R"rawliteral(
     <div class="row" style="margin-bottom:10px;">
         <div class="pill-soft">Start: <span id="startUidLabel">—</span></div>
         <div class="pill-soft">End: <span id="endUidLabel">—</span></div>
+        <div class="pill-soft">Z Start: <span id="zStartUidLabel">—</span></div>
+        <div class="pill-soft">Z End: <span id="zEndUidLabel">—</span></div>
         <div class="pill-soft">Текущий Z: <span id="currentZLabel">—</span></div>
     </div>
 
     <div class="btn-row" style="margin-bottom:12px;">
         <button class="secondary" id="btnLearnStart">📍 Считать Start</button>
         <button class="secondary" id="btnLearnEnd">🏁 Считать End</button>
+        <button class="secondary" id="btnLearnZStart">⬆ Считать Z Start</button>
+        <button class="secondary" id="btnLearnZEnd">⬇ Считать Z End</button>
     </div>
 
     <div style="overflow-x:auto;">
@@ -36,6 +40,7 @@ const char WEB_BATHS_CONTENT[] PROGMEM = R"rawliteral(
     </div>
 
     <div class="btn-row" style="margin-top:8px;">
+        <button class="secondary" id="btnAddBath">+ Add bath</button>
         <button class="secondary" id="btnReload">🟳 Обновить список</button>
         <button class="primary" id="btnSave">💾 Сохранить ванны</button>
     </div>
@@ -48,6 +53,7 @@ const char WEB_BATHS_CONTENT[] PROGMEM = R"rawliteral(
         </div>
         <div style="display:flex;align-items:flex-end;">
             <button class="secondary" id="btnLearnZ">↕ Считать Z-метку</button>
+            <button class="secondary" id="btnAutoZ">Auto Z</button>
         </div>
     </div>
 
@@ -57,6 +63,7 @@ const char WEB_BATHS_CONTENT[] PROGMEM = R"rawliteral(
             <tr>
                 <th>Уровень</th>
                 <th>UID RFID</th>
+                <th>Actions</th>
             </tr>
             </thead>
             <tbody></tbody>
@@ -98,6 +105,12 @@ async function loadBaths() {
 
         el("startUidLabel").textContent = uidToLabel(data.service_points?.start?.uid_hex);
         el("endUidLabel").textContent = uidToLabel(data.service_points?.end?.uid_hex);
+        el("zStartUidLabel").textContent = uidToLabel(data.service_points?.z_start?.uid_hex);
+        el("zEndUidLabel").textContent = uidToLabel(data.service_points?.z_end?.uid_hex);
+        if (el("currentZLabel")) {
+            const currentZ = (data.current_z_level ?? data.z_level);
+            el("currentZLabel").textContent = currentZ == null || currentZ === "" || currentZ < 0 ? "—" : String(currentZ);
+        }
 
         if (!data.baths || !data.baths.length) {
             const tr = document.createElement("tr");
@@ -111,7 +124,7 @@ async function loadBaths() {
                     <td>${idx + 1}</td>
                     <td><input type="number" min="0" max="65535" value="${b.bathNumber}"></td>
                     <td class="uid-cell">${uidToLabel(b.uid_hex)}</td>
-                    <td><button class="secondary btn-learn">📡 Считать метку</button></td>
+                    <td><button class="secondary btn-learn">Scan tag</button> <button class="secondary btn-delete">Delete</button></td>
                 `;
                 tbody.appendChild(tr);
             });
@@ -124,9 +137,11 @@ async function loadBaths() {
         } else {
             data.z_tags.forEach(z => {
                 const tr = document.createElement("tr");
+                tr.dataset.level = z.level;
                 tr.innerHTML = `
                     <td>${z.level}</td>
                     <td>${uidToLabel(z.uid_hex)}</td>
+                    <td><button class="secondary btn-z-relearn">Relearn</button> <button class="secondary btn-z-delete">Delete</button></td>
                 `;
                 zTbody.appendChild(tr);
             });
@@ -157,6 +172,38 @@ async function learnTagForRow(tr) {
     } catch (e) {
         console.error(e);
         setMsg(false, "Ошибка считывания: " + e.message);
+    }
+}
+
+async function addBath() {
+    setMsg(null, "Adding bath...");
+    try {
+        const res = await fetch("/baths_add", {method: "POST"});
+        const txt = await res.text();
+        if (!res.ok) throw new Error(txt || ("HTTP " + res.status));
+        setMsg(true, "Bath added");
+        await loadBaths();
+    } catch (e) {
+        console.error(e);
+        setMsg(false, "Add error: " + e.message);
+    }
+}
+
+async function deleteBath(tr) {
+    const idx = parseInt(tr.dataset.index, 10);
+    if (isNaN(idx)) return;
+    if (!confirm("Delete bath from list?")) return;
+
+    setMsg(null, "Deleting bath...");
+    try {
+        const res = await fetch("/baths_delete?index=" + encodeURIComponent(idx), {method: "POST"});
+        const txt = await res.text();
+        if (!res.ok) throw new Error(txt || ("HTTP " + res.status));
+        setMsg(true, "Bath deleted");
+        await loadBaths();
+    } catch (e) {
+        console.error(e);
+        setMsg(false, "Delete error: " + e.message);
     }
 }
 
@@ -206,6 +253,44 @@ async function learnServicePoint(kind) {
     }
 }
 
+async function autoLearnZ() {
+    const level = parseInt(el("zLevelInput").value || "0", 10);
+    setMsg(null, "Auto learn Z from level " + level + "...");
+    try {
+        const res = await fetch("/z_autolearn?start=" + encodeURIComponent(level), {method: "POST"});
+        const txt = await res.text();
+        if (!res.ok) throw new Error(txt || ("HTTP " + res.status));
+        const data = JSON.parse(txt);
+        setMsg(true, "Z auto learned, count=" + data.count);
+        await loadBaths();
+        await refreshStatus();
+    } catch (e) {
+        console.error(e);
+        setMsg(false, "Z auto learn error: " + e.message);
+    }
+}
+
+async function relearnZLevel(level) {
+    el("zLevelInput").value = level;
+    await learnZTag();
+}
+
+async function deleteZLevel(level) {
+    if (!confirm("Delete Z level " + level + "?")) return;
+    setMsg(null, "Deleting Z level " + level + "...");
+    try {
+        const res = await fetch("/z_tag_delete?level=" + encodeURIComponent(level), {method: "POST"});
+        const txt = await res.text();
+        if (!res.ok) throw new Error(txt || ("HTTP " + res.status));
+        setMsg(true, "Z level deleted");
+        await loadBaths();
+        await refreshStatus();
+    } catch (e) {
+        console.error(e);
+        setMsg(false, "Z delete error: " + e.message);
+    }
+}
+
 async function learnZTag() {
     const level = parseInt(el("zLevelInput").value || "0", 10);
     setMsg(null, "Считывание Z-метки уровня " + level + "...");
@@ -232,18 +317,52 @@ async function refreshStatus() {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+    el("btnAddBath").addEventListener("click", addBath);
     el("btnReload").addEventListener("click", loadBaths);
     el("btnSave").addEventListener("click", saveBaths);
     el("btnLearnStart").addEventListener("click", () => learnServicePoint("start"));
     el("btnLearnEnd").addEventListener("click", () => learnServicePoint("end"));
+    el("btnLearnZStart").addEventListener("click", () => learnServicePoint("z_start"));
+    el("btnLearnZEnd").addEventListener("click", () => learnServicePoint("z_end"));
     el("btnLearnZ").addEventListener("click", learnZTag);
+    el("btnAutoZ").addEventListener("click", autoLearnZ);
 
     el("bathsTable").addEventListener("click", (e) => {
         const btn = e.target.closest(".btn-learn");
-        if (!btn) return;
-        const tr = btn.closest("tr");
-        if (!tr) return;
-        learnTagForRow(tr);
+        if (btn) {
+            const tr = btn.closest("tr");
+            if (!tr) return;
+            learnTagForRow(tr);
+            return;
+        }
+
+        const delBtn = e.target.closest(".btn-delete");
+        if (delBtn) {
+            const tr = delBtn.closest("tr");
+            if (!tr) return;
+            deleteBath(tr);
+        }
+    });
+
+    el("zTagsTable").addEventListener("click", (e) => {
+        const relearnBtn = e.target.closest(".btn-z-relearn");
+        if (relearnBtn) {
+            const tr = relearnBtn.closest("tr");
+            if (!tr) return;
+            const level = parseInt(tr.dataset.level, 10);
+            if (isNaN(level)) return;
+            relearnZLevel(level);
+            return;
+        }
+
+        const delBtn = e.target.closest(".btn-z-delete");
+        if (delBtn) {
+            const tr = delBtn.closest("tr");
+            if (!tr) return;
+            const level = parseInt(tr.dataset.level, 10);
+            if (isNaN(level)) return;
+            deleteZLevel(level);
+        }
     });
 
     loadBaths();
@@ -264,6 +383,7 @@ String renderPageBaths() {
     html.replace("{{nav_monitor}}", "");
     html.replace("{{nav_routes}}", "");
     html.replace("{{nav_autolearn}}", "");
+    html.replace("{{nav_logs}}", "");
 
     html.replace("{{content}}", FPSTR(WEB_BATHS_CONTENT));
 

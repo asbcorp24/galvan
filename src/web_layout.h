@@ -220,6 +220,7 @@ const char WEB_LAYOUT[] PROGMEM = R"rawliteral(
             <a href="/routes_ui" class="nav-btn {{nav_routes}}">📋 Рецепты</a>
             <a href="/baths_ui" class="nav-btn {{nav_baths}}">🛰 RFID</a>
             <a href="/baths_autolearn_ui" class="nav-btn {{nav_autolearn}}">📡 Калибровка</a>
+            <a href="/logs_ui" class="nav-btn {{nav_logs}}">📚 Журнал</a>
         </nav>
     </header>
 

@@ -13,6 +13,7 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <Wire.h>
+#include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <RtcDS1302.h>
@@ -23,6 +24,7 @@
 #include "web_routes.h"
 #include "web_baths.h"
 #include "web_autolearn.h"
+#include "web_logs.h"
 #include <U8g2_for_Adafruit_GFX.h>
 #include <Adafruit_PN532.h>
 #include "web_layout.h"
@@ -47,6 +49,7 @@
 #define OLED_WIDTH   128
 #define OLED_HEIGHT  64
 #define OLED_ADDR    0x3C
+#define ENABLE_PN532_X_STARTUP 1
 
 // I2C
 #define I2C_SDA 21
@@ -66,16 +69,21 @@
 #define REL_FAN     2
 
 // Концевики по Z
-#define SW_Z_TOP     14
+#define SW_Z_TOP     0
 #define SW_Z_BOTTOM  13
 
-#define PN532_IRQ   25   // для I2C-конструктора библиотеки; может быть не подключен физически
-#define PN532_RESET 27
+#define PN532_X_SCK    25
+#define PN532_X_MISO   39
+#define PN532_X_MOSI   27
+#define PN532_X_SS     14
+#define PN532_Z_RX     36   // TX пина PN532 Z -> RX ESP32
+#define PN532_Z_TX     33   // RX пина PN532 Z <- TX ESP32
+#define PN532_Z_RESET  255
 // Аварийный стоп
 #define PIN_ESTOP  26
 
 // Кнопка START (дубль веб-старта)
-#define BTN_START  33
+#define BTN_START  39
 
 // Энкодер
 #define ENC_A      34
@@ -100,6 +108,8 @@ static const char* NVS_KEY_BATH_COUNT = "bath_cnt";
 static const char* NVS_KEY_BATH_TAGS  = "bath_tags";
 static const char* NVS_KEY_START_POINT = "start_pt";
 static const char* NVS_KEY_END_POINT   = "end_pt";
+static const char* NVS_KEY_Z_START_POINT = "z_start_pt";
+static const char* NVS_KEY_Z_END_POINT   = "z_end_pt";
 static const char* NVS_KEY_ZTAG_COUNT  = "ztag_cnt";
 static const char* NVS_KEY_ZTAG_DATA   = "ztag_data";
 
@@ -136,7 +146,9 @@ enum LastDetectedKind : uint8_t {
     LDK_PROCESS = 1,
     LDK_START   = 2,
     LDK_END     = 3,
-    LDK_Z_LEVEL = 4
+    LDK_Z_LEVEL = 4,
+    LDK_Z_START = 5,
+    LDK_Z_END   = 6
 };
 
 struct ServicePointInfo {
@@ -158,6 +170,15 @@ struct LastDetectedInfo {
     uint8_t uid[7];
 };
 
+struct ActionLogEntry {
+    uint32_t seq;
+    String date;
+    String time;
+    String level;
+    String category;
+    String message;
+};
+
 // Описание рабочей ванны с RFID
 struct BathInfo {
     uint16_t bathNumber;   // логический номер ванны (для маршрутов)
@@ -172,8 +193,15 @@ std::vector<BathInfo> g_baths;
 std::vector<ZTagInfo> g_zTags;
 ServicePointInfo g_startPoint = {};
 ServicePointInfo g_endPoint   = {};
+ServicePointInfo g_zStartPoint = {};
+ServicePointInfo g_zEndPoint   = {};
 LastDetectedInfo g_lastDetected = {};
 volatile int16_t g_currentZLevel = -1;
+static const size_t ACTION_LOG_CAPACITY = 80;
+ActionLogEntry g_actionLog[ACTION_LOG_CAPACITY];
+size_t g_actionLogHead = 0;
+size_t g_actionLogCount = 0;
+uint32_t g_actionLogSeq = 0;
 
 
 // слоты шаблонов
@@ -257,15 +285,41 @@ volatile int16_t bathIndex = 0;
 // Направление движения по X (true = вправо, false = влево)
 volatile bool    dirRight  = true;
 
+// ---------------- FORWARD DECLARATIONS ----------------
 
-// PN532 работает по I2C. Библиотека требует irq/reset в конструкторе, даже если IRQ не используется логикой.
-Adafruit_PN532 nfc(PN532_IRQ, PN532_RESET, &Wire);
+void relOffAll();
+void xFwd(bool en);
+void xRev(bool en);
+void zUpRelay(bool en);
+void zDownRelay(bool en);
+void addActionLog(const char *level, const char *category, const String &message);
+String rtcTimeString();
+String rtcDateString();
+bool moveToBathIndex(int targetBathIndex, uint32_t timeoutMs);
+bool moveToServicePoint(const ServicePointInfo &point, const char *label, bool isStartPoint, bool moveRight, uint32_t timeoutMs);
+bool moveToZServicePoint(const ServicePointInfo &point, const char *label, bool isStartPoint, bool moveDown, uint32_t timeoutMs);
+bool moveZToLevel(int16_t targetLevel, bool moveDown, uint16_t timeoutSec);
+
+
+HardwareSerial pn532ZSerial(2);
+Adafruit_PN532 nfcX(PN532_X_SCK, PN532_X_MISO, PN532_X_MOSI, PN532_X_SS);
+Adafruit_PN532 nfcZ(PN532_Z_RESET, &pn532ZSerial);
+bool nfcXReady = false;
+bool nfcZReady = false;
 
 
 
 // Меню выбора шаблона
 volatile int16_t g_selectedRoute = 0;   // 0..ROUTE_SLOTS-1
 volatile bool    g_inSelectMenu  = false;
+enum UiMode : uint8_t {
+    UI_HOME = 0,
+    UI_MAIN_MENU,
+    UI_ROUTE_SELECT,
+    UI_SETTINGS
+};
+volatile UiMode g_uiMode = UI_HOME;
+volatile int16_t g_menuIndex = 0;
 
 // Энкодер
 volatile int g_encDelta = 0;
@@ -300,6 +354,97 @@ String uidToHexString(const uint8_t *uid, uint8_t len) {
     return s;
 }
 
+void debugPrintUid(const char *prefix, const uint8_t *uid, uint8_t uidLen) {
+    DBG_PRINT(prefix ? prefix : "[RFID] UID");
+    DBG_PRINT(": ");
+    if (!uid || uidLen == 0) {
+        DBG_PRINTLN("(none)");
+        return;
+    }
+    for (uint8_t i = 0; i < uidLen; ++i) {
+        DBG_PRINTF("%02X", uid[i]);
+        if (i + 1 < uidLen) DBG_PRINT(" ");
+    }
+    DBG_PRINTLN("");
+}
+
+bool i2cDevicePresent(uint8_t addr) {
+    Wire.beginTransmission(addr);
+    return Wire.endTransmission() == 0;
+}
+
+void scanI2CBus(const char *label) {
+    DBG_PRINTF("[I2C] scan start: %s\r\n", label ? label : "bus");
+    int found = 0;
+    DBG_PRINTF("[I2C] scan done: found=%d\r\n", found);
+}
+
+bool readPassiveTargetX(uint8_t *uid, uint8_t *uidLen, uint16_t timeoutMs = 50) {
+    if (!nfcXReady) return false;
+    return nfcX.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, uidLen, timeoutMs);
+}
+
+bool readPassiveTargetZ(uint8_t *uid, uint8_t *uidLen, uint16_t timeoutMs = 50) {
+    if (!nfcZReady) return false;
+    return nfcZ.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, uidLen, timeoutMs);
+}
+
+bool waitForTagRelease(Adafruit_PN532 &reader, bool ready, const char *ctx, uint32_t timeoutMs) {
+    if (!ready) return false;
+    uint32_t t0 = millis();
+    uint8_t missCount = 0;
+    while (millis() - t0 < timeoutMs) {
+        uint8_t uid[7] = {0};
+        uint8_t uidLen = 0;
+        if (!reader.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen, 30)) {
+            missCount++;
+            if (missCount >= 3) {
+                DBG_PRINTF("[RFID] %s tag released\r\n", ctx ? ctx : "unknown");
+                return true;
+            }
+        } else {
+            missCount = 0;
+        }
+        delay(30);
+    }
+    DBG_PRINTF("[RFID] %s release wait timeout\r\n", ctx ? ctx : "unknown");
+    return false;
+}
+
+bool readUidWithTimeout(Adafruit_PN532 &reader, bool ready, const char *ctx, uint8_t *uid, uint8_t *uidLen, uint32_t timeoutMs) {
+    if (!uid || !uidLen) return false;
+    *uidLen = 0;
+    if (!ready) {
+        DBG_PRINTF("[RFID] %s: reader not ready\r\n", ctx ? ctx : "read");
+        return false;
+    }
+
+    DBG_PRINTF("[RFID] %s: waiting for tag, timeout=%lu ms\r\n",
+               ctx ? ctx : "read",
+               (unsigned long)timeoutMs);
+
+    const uint32_t t0 = millis();
+    uint32_t lastLog = 0;
+    while (millis() - t0 < timeoutMs) {
+        if (reader.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, uidLen, 50)) {
+            DBG_PRINTF("[RFID] %s: tag detected, uidLen=%u\r\n",
+                       ctx ? ctx : "read",
+                       (unsigned)*uidLen);
+            debugPrintUid("[RFID] UID", uid, *uidLen);
+            return true;
+        }
+
+        if (millis() - lastLog >= 500) {
+            lastLog = millis();
+            DBG_PRINTF("[RFID] %s: still waiting...\r\n", ctx ? ctx : "read");
+        }
+        delay(30);
+    }
+
+    DBG_PRINTF("[RFID] %s: timeout, tag not detected\r\n", ctx ? ctx : "read");
+    return false;
+}
+
 void clearServicePoint(ServicePointInfo &point) {
     point.uidLen = 0;
     memset(point.uid, 0, sizeof(point.uid));
@@ -329,6 +474,21 @@ void noteLastDetected(uint8_t kind, int16_t number, const uint8_t *uid, uint8_t 
     memset(g_lastDetected.uid, 0, sizeof(g_lastDetected.uid));
     if (g_lastDetected.uidLen > 0) {
         memcpy(g_lastDetected.uid, uid, g_lastDetected.uidLen);
+    }
+}
+
+void addActionLog(const char *level, const char *category, const String &message) {
+    ActionLogEntry &entry = g_actionLog[g_actionLogHead];
+    entry.seq = ++g_actionLogSeq;
+    entry.date = rtcDateString();
+    entry.time = rtcTimeString();
+    entry.level = level ? level : "info";
+    entry.category = category ? category : "system";
+    entry.message = message;
+
+    g_actionLogHead = (g_actionLogHead + 1) % ACTION_LOG_CAPACITY;
+    if (g_actionLogCount < ACTION_LOG_CAPACITY) {
+        g_actionLogCount++;
     }
 }
 
@@ -594,6 +754,20 @@ bool captureKnownZLevel(const uint8_t uid[], uint8_t uidLen) {
     noteLastDetected(LDK_Z_LEVEL, g_currentZLevel, uid, uidLen);
     DBG_PRINTF("[MOVE_Z] Detected Z level=%d\r\n", (int)g_currentZLevel);
     return true;
+}
+
+bool captureKnownZServicePoint(const uint8_t uid[], uint8_t uidLen, bool &isStart, bool &isEnd) {
+    isStart = servicePointMatches(g_zStartPoint, uid, uidLen);
+    isEnd = servicePointMatches(g_zEndPoint, uid, uidLen);
+    if (isStart) {
+        noteLastDetected(LDK_Z_START, -1, uid, uidLen);
+        DBG_PRINTLN(F("[MOVE_Z] Detected Z START service point"));
+    }
+    if (isEnd) {
+        noteLastDetected(LDK_Z_END, -1, uid, uidLen);
+        DBG_PRINTLN(F("[MOVE_Z] Detected Z END service point"));
+    }
+    return isStart || isEnd;
 }
 
 // Добавить новую ванну или обновить существующую
@@ -937,27 +1111,68 @@ String rtcDateString() {
 
 void nfcInit() {
     DBG_PRINTLN(F("[PN532] init start"));
+    DBG_PRINTF("[PINMAP] nfcX SPI: SCK=%d MISO=%d MOSI=%d SS=%d\r\n",
+               PN532_X_SCK, PN532_X_MISO, PN532_X_MOSI, PN532_X_SS);
+    DBG_PRINTF("[PINMAP] nfcZ: RX=%d TX=%d RST=%d\r\n",
+               PN532_Z_RX, PN532_Z_TX, PN532_Z_RESET);
 
-    //Wire.begin(I2C_SDA, I2C_SCL);
+#if ENABLE_PN532_X_STARTUP
+    DBG_PRINTLN(F("[PN532-X] init start (SPI)"));
+    pinMode(PN532_X_SS, OUTPUT);
+    digitalWrite(PN532_X_SS, HIGH);
+    delay(50);
 
-    nfc.begin();
+    DBG_PRINTLN(F("[PN532-X] begin()..."));
+    nfcX.begin();
+    DBG_PRINTLN(F("[PN532-X] begin() returned"));
 
-
-    uint32_t versiondata = nfc.getFirmwareVersion();
-    if (!versiondata) {
-        DBG_PRINTLN(F("[PN532] Didn't find PN53x board"));
-        return;
+    uint32_t versiondata = 0;
+    for (int attempt = 1; attempt <= 3; ++attempt) {
+        versiondata = nfcX.getFirmwareVersion();
+        DBG_PRINTF("[PN532-X] getFirmwareVersion attempt %d = 0x%08lX\r\n",
+                   attempt, (unsigned long)versiondata);
+        if (versiondata) break;
+        delay(150);
     }
 
-    DBG_PRINTF("[PN532] Chip: 0x%02X, Ver: %u.%u\r\n",
-               (uint8_t)(versiondata >> 24),
-               (uint8_t)((versiondata >> 16) & 0xFF),
-               (uint8_t)((versiondata >> 8)  & 0xFF));
+    if (versiondata) {
+        DBG_PRINTF("[PN532-X] Chip: 0x%02X, Ver: %u.%u\r\n",
+                   (uint8_t)(versiondata >> 24),
+                   (uint8_t)((versiondata >> 16) & 0xFF),
+                   (uint8_t)((versiondata >> 8)  & 0xFF));
+        DBG_PRINTLN(F("[PN532-X] setPassiveActivationRetries..."));
+        nfcX.setPassiveActivationRetries(0x05);
+        DBG_PRINTLN(F("[PN532-X] setPassiveActivationRetries done"));
+        nfcXReady = true;
+        DBG_PRINTLN(F("[PN532-X] init done"));
+    } else {
+        DBG_PRINTLN(F("[PN532-X] firmware read failed"));
+    }
+#else
+    DBG_PRINTLN(F("[PN532-X] startup init skipped (temporary workaround)"));
+#endif
 
-    // Конфигурируем PN532 в режиме чтения пассивных карт
-    nfc.SAMConfig();
+    DBG_PRINTLN(F("[PN532-Z] init start (HSU/UART2)"));
+    pn532ZSerial.begin(115200, SERIAL_8N1, PN532_Z_RX, PN532_Z_TX);
+    if (nfcZ.begin()) {
+        uint32_t versiondata = nfcZ.getFirmwareVersion();
+        if (versiondata) {
+            DBG_PRINTF("[PN532-Z] Chip: 0x%02X, Ver: %u.%u\r\n",
+                       (uint8_t)(versiondata >> 24),
+                       (uint8_t)((versiondata >> 16) & 0xFF),
+                       (uint8_t)((versiondata >> 8)  & 0xFF));
+            nfcZ.setPassiveActivationRetries(0x05);
+            nfcZ.SAMConfig();
+            nfcZReady = true;
+            DBG_PRINTLN(F("[PN532-Z] init done"));
+        } else {
+            DBG_PRINTLN(F("[PN532-Z] firmware read failed"));
+        }
+    } else {
+        DBG_PRINTLN(F("[PN532-Z] begin() failed"));
+    }
 
-    DBG_PRINTLN(F("[PN532] init done"));
+    DBG_PRINTF("[PN532] ready state: X=%d Z=%d\r\n", (int)nfcXReady, (int)nfcZReady);
 }
 
 // Чтение RFID-метки.
@@ -968,12 +1183,11 @@ bool readTag(int &detectedBath)
     uint8_t uid[7] = {0};
     uint8_t uidLength = 0;
 
-    bool success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A,
-                                           uid, &uidLength);
+    bool success = readPassiveTargetX(uid, &uidLength);
     if (!success) return false;
 
     // выводим UID
-    DBG_PRINT("[PN532] UID = ");
+    DBG_PRINT("[PN532-X] UID = ");
     for (uint8_t i = 0; i < uidLength; i++) {
         DBG_PRINTF("%02X ", uid[i]);
     }
@@ -1021,7 +1235,11 @@ void nfcTestLoop() {
     uint8_t uid[7];
     uint8_t uidLength;
 
-    oled.clearDisplay();
+    if (!oledReady) {
+        Serial.println("[NFC] OLED not ready, skipping display output");
+    }
+
+    if (oledReady) oled.clearDisplay();
     oled.setCursor(0, 0);
     oled.println("NFC TEST MODE");
     oled.println("Поднесите метку...");
@@ -1031,8 +1249,7 @@ void nfcTestLoop() {
         uint8_t uid[7] = {0};
         uint8_t uidLength = 0;
 
-        bool success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A,
-                                               uid, &uidLength);
+        bool success = readPassiveTargetX(uid, &uidLength);
         if (success) {
             Serial.print("[NFC] UID: ");
             for (uint8_t i = 0; i < uidLength; i++) {
@@ -1040,13 +1257,15 @@ void nfcTestLoop() {
             }
             Serial.println();
 
-            oled.clearDisplay();
-            oled.setCursor(0, 0);
-            oled.println("NFC UID FOUND:");
-            for (uint8_t i = 0; i < uidLength; i++) {
-                oled.printf("%02X ", uid[i]);
+            if (oledReady) {
+                oled.clearDisplay();
+                oled.setCursor(0, 0);
+                oled.println("NFC UID FOUND:");
+                for (uint8_t i = 0; i < uidLength; i++) {
+                    oled.printf("%02X ", uid[i]);
+                }
+                oled.display();
             }
-            oled.display();
 
             delay(1500);
 
@@ -1062,6 +1281,7 @@ void nfcTestLoop() {
 
 // ---------------- OLED ----------------
 void oledShowLearn(int foundCount, uint8_t* uid, uint8_t uidLen) {
+    if (!oledReady) return;
     oled.clearDisplay();
     u8g2.setFont(u8g2_font_6x12_t_cyrillic);
 
@@ -1094,7 +1314,7 @@ void oledInit() {
 
     // проверяем шину I2C
     Wire.begin(I2C_SDA, I2C_SCL);
-    Wire.setClock(400000);
+    Wire.setClock(100000);
 
     // тест: пин сканер
     Wire.beginTransmission(OLED_ADDR);
@@ -1139,85 +1359,105 @@ void initBathTables() {
 
 
 void oledShowIdle() {
-   // DBG_PRINTLN(F("[OLED] show IDLE screen"));
-    u8g2.setFont(u8g2_font_6x12_t_cyrillic);   // ← РУССКИЙ ШРИФТ
+    if (!oledReady) return;
+    u8g2.setFont(u8g2_font_6x12_t_cyrillic);
     oled.clearDisplay();
- u8g2.setCursor(0, 10);
+
+    uint16_t activeRouteId = getActiveRouteId();
+
+    u8g2.setCursor(0, 10);
     u8g2.print(rtcTimeString());
-    u8g2.setCursor(60, 10);
-    u8g2.print(rtcDateString());
 
-    u8g2.setCursor(0, 25);
-    u8g2.print("Состояние: IDLE");
+    u8g2.setCursor(0, 24);
+    u8g2.print(F("IDLE"));
+    u8g2.setCursor(44, 24);
+    u8g2.print(F("R:"));
+    if (activeRouteId == 0xFFFF) u8g2.print(F("-"));
+    else u8g2.print(activeRouteId);
 
-    u8g2.setCursor(0,36);
-    u8g2.print("Ванна: ");
+    u8g2.setCursor(0, 38);
+    u8g2.print(F("B:"));
     u8g2.print(g_currentBath);
-
-    u8g2.setCursor(0, 48);
-    u8g2.print("Шагов: ");
+    u8g2.setCursor(44, 38);
+    u8g2.print(F("ST:"));
     u8g2.print(g_routeSteps);
-     u8g2.setCursor(0, 58);
-    u8g2.print(F("START=запуск"));
-    u8g2.print(F("ENC=выбор шаблона"));
+
+    u8g2.setCursor(0, 52);
+    u8g2.print(F("Z:"));
+    if (g_currentZLevel >= 0) u8g2.print(g_currentZLevel);
+    else u8g2.print(F("-"));
+
+    u8g2.setCursor(0, 62);
+    u8g2.print(F("BTN=MENU"));
     oled.display();
 }
 
 void oledShowRun() {
-  //  DBG_PRINTF("[OLED] show RUN screen, state=%d, stepIdx=%d\r\n", (int)g_state, (int)g_stepIdx);
+    if (!oledReady) return;
     oled.clearDisplay();
-    oled.setCursor(0,0);
-    oled.println(rtcTimeString());
+    u8g2.setFont(u8g2_font_6x12_t_cyrillic);
 
-    oled.print(F("Bath: "));
-    oled.println(g_currentBath);
-
-    oled.print(F("Step: "));
-    oled.print(g_stepIdx + 1);
-    oled.print(F("/"));
-    oled.println(g_routeSteps);
-
-    oled.print(F("State: "));
+    const __FlashStringHelper* stateLabel = F("RUN");
     switch (g_state) {
-        case PS_HOMING:      oled.println(F("HOMING")); break;
-        case PS_MOVE_X:      oled.println(F("MOVE_X")); break;
-        case PS_LOWER_Z:     oled.println(F("LOWER_Z")); break;
-        case PS_HOLD:        oled.println(F("HOLD")); break;
-        case PS_RAISE_Z:     oled.println(F("RAISE_Z")); break;
-        case PS_DRY:         oled.println(F("DRY")); break;
-        case PS_RETURN_HOME: oled.println(F("RETURN")); break;
-        case PS_ERROR:       oled.println(F("ERROR")); break;
-        default:             oled.println(F("RUN")); break;
+        case PS_HOMING:      stateLabel = F("HOME"); break;
+        case PS_MOVE_X:      stateLabel = F("MOVE X"); break;
+        case PS_LOWER_Z:     stateLabel = F("DOWN"); break;
+        case PS_HOLD:        stateLabel = F("HOLD"); break;
+        case PS_RAISE_Z:     stateLabel = F("UP"); break;
+        case PS_DRY:         stateLabel = F("DRY"); break;
+        case PS_RETURN_HOME: stateLabel = F("RETURN"); break;
+        case PS_ERROR:       stateLabel = F("ERROR"); break;
+        default:             break;
     }
-        oled.print(g_currentBath);
-        oled.print("follow: ");
-        oled.println(g_targetBath >= 0 ? g_targetBath : g_currentBath);
+
+    u8g2.setCursor(0, 10);
+    u8g2.print(rtcTimeString());
+
+    u8g2.setCursor(0, 24);
+    u8g2.print(stateLabel);
+
+    u8g2.setCursor(0, 38);
+    u8g2.print(F("STEP:"));
+    u8g2.print(g_stepIdx + 1);
+    u8g2.print(F("/"));
+    u8g2.print(g_routeSteps);
+    u8g2.setCursor(72, 38);
+    u8g2.print(F("B:"));
+    u8g2.print(g_currentBath);
+
+    u8g2.setCursor(0, 52);
+    u8g2.print(F("TO:"));
+    if (g_targetBath >= 0) u8g2.print(g_targetBath);
+    else u8g2.print(g_currentBath);
+    u8g2.setCursor(72, 52);
+    u8g2.print(F("Z:"));
+    if (g_currentZLevel >= 0) u8g2.print(g_currentZLevel);
+    else u8g2.print(F("-"));
+
+    u8g2.setCursor(0, 62);
+    u8g2.print(F("STOP=BTN"));
     oled.display();
 }
 
 void oledShowSelectMenu() {
+    if (!oledReady) return;
     DBG_PRINTF("[OLED] show select menu, selected=%d\r\n", (int)g_selectedRoute);
 
     oled.clearDisplay();
     u8g2.setFont(u8g2_font_6x12_t_cyrillic);
 
     const int lineHeight = 14;
-    const int maxVisible = 3;     // <<< ПОКАЗЫВАЕМ 3 СТРОКИ
-    const int startY = 22;
+    const int maxVisible = 3;
+    const int startY = 24;
 
-    // Рамка окна
     oled.drawRect(0, 0, 128, 64, SSD1306_WHITE);
-
-    // Заголовок
     oled.setTextColor(SSD1306_WHITE);
-    u8g2.setCursor(10, 12);
-    u8g2.print("Выбор шаблона");
+    u8g2.setCursor(8, 12);
+    u8g2.print(F("ROUTE SELECT"));
 
-    // --- ПРОКРУТКА ---
     int total = ROUTE_SLOTS;
     int first = 0;
 
-    // Смещаем окно так, чтобы выбранный пункт был по центру
     if (g_selectedRoute > 0) {
         first = g_selectedRoute - 1;
         if (first > total - maxVisible)
@@ -1225,43 +1465,97 @@ void oledShowSelectMenu() {
         if (first < 0) first = 0;
     }
 
-    // --- СПИСОК ---
     for (int i = 0; i < maxVisible; i++) {
         int idx = first + i;
         if (idx >= total) break;
 
         int yText = startY + i * lineHeight;
-
         bool selected = (idx == g_selectedRoute);
 
         if (selected) {
-            // Стильная рамка вокруг строки
-            oled.drawRect(
-                4,            // x
-                yText - 11,   // y
-                120,          // width
-                lineHeight,   // height
-                SSD1306_WHITE
-            );
+            oled.drawRect(4, yText - 11, 120, lineHeight, SSD1306_WHITE);
         }
 
-        // Текст обычный
         oled.setTextColor(SSD1306_WHITE);
-
         u8g2.setCursor(8, yText);
-        u8g2.print("Шаблон ");
+        u8g2.print(F("R"));
         u8g2.print(idx);
+        if ((uint8_t)idx == (uint8_t)g_selectedRoute) u8g2.print(F(" *"));
     }
 
     oled.display();
 }
 
+void oledShowMainMenu() {
+    if (!oledReady) return;
+    static const char* items[] = {"START", "ROUTE", "STATUS"};
+    const int itemCount = 3;
 
+    oled.clearDisplay();
+    u8g2.setFont(u8g2_font_6x12_t_cyrillic);
+    oled.drawRect(0, 0, 128, 64, SSD1306_WHITE);
 
-// ---------------- РЕЛЕ ----------------
+    u8g2.setCursor(8, 12);
+    u8g2.print(F("MAIN MENU"));
+
+    for (int i = 0; i < itemCount; ++i) {
+        const int y = 24 + i * 13;
+        if (i == g_menuIndex) {
+            oled.drawRect(4, y - 10, 120, 12, SSD1306_WHITE);
+        }
+        u8g2.setCursor(8, y);
+        u8g2.print(items[i]);
+    }
+
+    oled.display();
+}
+
+void oledShowSettings() {
+    if (!oledReady) return;
+    uint16_t activeRouteId = getActiveRouteId();
+    IPAddress ip = WiFi.softAPIP();
+
+    oled.clearDisplay();
+    u8g2.setFont(u8g2_font_6x12_t_cyrillic);
+
+    u8g2.setCursor(0, 10);
+    u8g2.print(F("STATUS"));
+
+    u8g2.setCursor(0, 24);
+    u8g2.print(F("R:"));
+    if (activeRouteId == 0xFFFF) u8g2.print(F("-"));
+    else u8g2.print(activeRouteId);
+    u8g2.setCursor(44, 24);
+    u8g2.print(F("B:"));
+    u8g2.print(dynamicBathCount);
+
+    u8g2.setCursor(0, 36);
+    u8g2.print(F("Z:"));
+    if (g_currentZLevel >= 0) u8g2.print(g_currentZLevel);
+    else u8g2.print(F("-"));
+    u8g2.print(F("/"));
+    u8g2.print((int)g_zTags.size());
+    u8g2.setCursor(44, 36);
+    u8g2.print(F("ST:"));
+    u8g2.print(g_routeSteps);
+
+    u8g2.setCursor(0, 48);
+    u8g2.print(F("S:"));
+    u8g2.print(g_startPoint.configured ? F("OK") : F("--"));
+    u8g2.setCursor(44, 48);
+    u8g2.print(F("E:"));
+    u8g2.print(g_endPoint.configured ? F("OK") : F("--"));
+
+    u8g2.setCursor(0, 60);
+    u8g2.print(F("IP:"));
+    u8g2.print(ip);
+    oled.display();
+}
+
+// ---------------- ЭНКОДЕР + КНОПКА ----------------
+// ---------------- ???? ----------------
 
 void relOffAll() {
- 
     digitalWrite(REL_X_FWD, OFF);
     digitalWrite(REL_X_REV, OFF);
     digitalWrite(REL_Z_UP, OFF);
@@ -1294,7 +1588,6 @@ void zDownRelay(bool en) {
     digitalWrite(REL_Z_DOWN, en ? ON : OFF);
 }
 
-// ---------------- ЭНКОДЕР + КНОПКА ----------------
 void IRAM_ATTR encISR() {
     bool a = digitalRead(ENC_A);
     bool b = digitalRead(ENC_B);
@@ -1314,6 +1607,11 @@ int getEncDelta() {
 
 // Обработка кнопки START с антидребезгом
 bool startButtonPressed() {
+#if BTN_START == 39
+    // GPIO39 has no internal pull-up on ESP32, so this temporary remap
+    // causes floating false presses without an external resistor.
+    return false;
+#else
     static uint32_t last = 0;
     if (digitalRead(BTN_START) == LOW) {
         uint32_t now = millis();
@@ -1324,6 +1622,7 @@ bool startButtonPressed() {
         }
     }
     return false;
+#endif
 }
 
 // ---------------- ДВИЖЕНИЕ X — RFID версия ----------------
@@ -1423,7 +1722,7 @@ bool moveToBathIndex(int targetBathIndex, uint32_t timeoutMs)
         int detectedBath = -1;
 
         // читаем RFID
-        bool ok = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen);
+        bool ok = readPassiveTargetX(uid, &uidLen);
 
         if (ok) {
             DBG_PRINT("[MOVE_X] Saw UID: ");
@@ -1493,6 +1792,19 @@ g_currentBath = getBathDisplayNumberByIndex(shadowBath);
     return false;
 }
 
+bool encoderButtonPressed() {
+    static uint32_t last = 0;
+    if (digitalRead(ENC_SW) == LOW) {
+        uint32_t now = millis();
+        if (now - last > 250) {
+            last = now;
+            DBG_PRINTLN(F("[BTN] ENC_SW pressed"));
+            return true;
+        }
+    }
+    return false;
+}
+
 bool moveToBathNumber(uint16_t bathNumber, uint32_t timeoutMs) {
     int targetIndex = findBathStorageIndexByNumber(bathNumber);
     if (targetIndex < 0) {
@@ -1533,7 +1845,7 @@ bool moveToServicePoint(const ServicePointInfo &point, const char *label, bool i
 
         uint8_t uid[7];
         uint8_t uidLen = 0;
-        if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen)) {
+        if (readPassiveTargetX(uid, &uidLen)) {
             int detectedBath = findBathIndexByUID(uid, uidLen);
             if (detectedBath >= 0) {
                 bathIndex = detectedBath;
@@ -1569,6 +1881,73 @@ bool moveToServicePoint(const ServicePointInfo &point, const char *label, bool i
 bool moveToStartPoint(uint32_t timeoutMs) {
     return moveToServicePoint(g_startPoint, "start", true, false, timeoutMs);
 }
+
+bool moveToZServicePoint(const ServicePointInfo &point, const char *label, bool isStartPoint, bool moveDown, uint32_t timeoutMs) {
+    if (!point.configured) {
+        DBG_PRINTF("[MOVE_Z] %s point is not configured\r\n", label ? label : "z_service");
+        return false;
+    }
+
+    uint8_t lastUid[7] = {0};
+    uint8_t lastLen = 0;
+    int stableCount = 0;
+    const int STABLE_REQUIRED = 2;
+    const uint32_t t0 = millis();
+
+    if (moveDown) {
+        zUpRelay(false);
+        zDownRelay(true);
+    } else {
+        zDownRelay(false);
+        zUpRelay(true);
+    }
+
+    while (millis() - t0 < timeoutMs) {
+        if (digitalRead(PIN_ESTOP) == LOW) {
+            DBG_PRINTLN(F("[MOVE_Z] ESTOP while moving to Z service point"));
+            zDownRelay(false);
+            zUpRelay(false);
+            return false;
+        }
+
+        uint8_t uid[7] = {0};
+        uint8_t uidLen = 0;
+        if (readPassiveTargetZ(uid, &uidLen)) {
+            captureKnownZLevel(uid, uidLen);
+
+            if (uidLen == lastLen && uidEquals(uid, lastUid, uidLen)) {
+                stableCount++;
+            } else {
+                memcpy(lastUid, uid, uidLen);
+                lastLen = uidLen;
+                stableCount = 1;
+            }
+
+            if (stableCount >= STABLE_REQUIRED && servicePointMatches(point, uid, uidLen)) {
+                noteLastDetected(isStartPoint ? LDK_Z_START : LDK_Z_END, -1, uid, uidLen);
+                zDownRelay(false);
+                zUpRelay(false);
+                DBG_PRINTF("[MOVE_Z] Reached %s\r\n", label ? label : "z_service");
+                return true;
+            }
+        }
+
+        vTaskDelay(20 / portTICK_PERIOD_MS);
+    }
+
+    zDownRelay(false);
+    zUpRelay(false);
+    DBG_PRINTF("[MOVE_Z] Timeout while moving to %s\r\n", label ? label : "z_service");
+    return false;
+}
+
+bool moveToZStartPoint(uint32_t timeoutMs) {
+    return moveToZServicePoint(g_zStartPoint, "z_start", true, false, timeoutMs);
+}
+
+bool moveToZEndPoint(uint32_t timeoutMs) {
+    return moveToZServicePoint(g_zEndPoint, "z_end", false, true, timeoutMs);
+}
 // ---------------- ДВИЖЕНИЕ Z ----------------
 bool zDown_for(uint16_t sec) {
     DBG_PRINTF("[MOVE_Z] zDown_for sec=%u\r\n", sec);
@@ -1586,21 +1965,15 @@ bool zDown_for(uint16_t sec) {
 
         uint8_t uid[7] = {0};
         uint8_t uidLen = 0;
-        if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen)) {
+        if (readPassiveTargetZ(uid, &uidLen)) {
             captureKnownZLevel(uid, uidLen);
-        }
-
-        // вниз нельзя, если верхний концевик нажат (мы уже вверху)
-        if (digitalRead(SW_Z_TOP) == LOW) {
-            DBG_PRINTLN(F("[MOVE_Z] SW_Z_TOP active while going down, error"));
-            zDownRelay(false);
-            return false;
-        }
-        // нижний концевик — дошли раньше времени
-        if (digitalRead(SW_Z_BOTTOM) == LOW) {
-            DBG_PRINTLN(F("[MOVE_Z] reached bottom switch earlier"));
-            zDownRelay(false);
-            return true;
+            bool isStart = false, isEnd = false;
+            captureKnownZServicePoint(uid, uidLen, isStart, isEnd);
+            if (isEnd) {
+                DBG_PRINTLN(F("[MOVE_Z] reached Z END service point"));
+                zDownRelay(false);
+                return true;
+            }
         }
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
@@ -1627,21 +2000,15 @@ bool zUp_for(uint16_t sec) {
 
         uint8_t uid[7] = {0};
         uint8_t uidLen = 0;
-        if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen)) {
+        if (readPassiveTargetZ(uid, &uidLen)) {
             captureKnownZLevel(uid, uidLen);
-        }
-
-        // вверх нельзя, если нижний концевик нажат
-        if (digitalRead(SW_Z_BOTTOM) == LOW) {
-            DBG_PRINTLN(F("[MOVE_Z] SW_Z_BOTTOM active while going up, error"));
-            zUpRelay(false);
-            return false;
-        }
-        // верхний концевик — дошли
-        if (digitalRead(SW_Z_TOP) == LOW) {
-            DBG_PRINTLN(F("[MOVE_Z] reached top switch"));
-            zUpRelay(false);
-            return true;
+            bool isStart = false, isEnd = false;
+            captureKnownZServicePoint(uid, uidLen, isStart, isEnd);
+            if (isStart) {
+                DBG_PRINTLN(F("[MOVE_Z] reached Z START service point"));
+                zUpRelay(false);
+                return true;
+            }
         }
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
@@ -1689,35 +2056,23 @@ bool moveZToLevel(int16_t targetLevel, bool moveDown, uint16_t timeoutSec) {
 
         uint8_t uid[7] = {0};
         uint8_t uidLen = 0;
-        if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen)) {
+        if (readPassiveTargetZ(uid, &uidLen)) {
             captureKnownZLevel(uid, uidLen);
+            bool isStart = false, isEnd = false;
+            captureKnownZServicePoint(uid, uidLen, isStart, isEnd);
             if (g_currentZLevel == targetLevel) {
                 zDownRelay(false);
                 zUpRelay(false);
                 DBG_PRINTLN(F("[MOVE_Z] Target Z level reached"));
                 return true;
             }
-        }
-
-        if (moveDown) {
-            if (digitalRead(SW_Z_TOP) == LOW) {
-                DBG_PRINTLN(F("[MOVE_Z] SW_Z_TOP active while moving down"));
+            if (moveDown && isEnd) {
+                DBG_PRINTLN(F("[MOVE_Z] Reached Z END before target level"));
                 zDownRelay(false);
                 return false;
             }
-            if (digitalRead(SW_Z_BOTTOM) == LOW) {
-                DBG_PRINTLN(F("[MOVE_Z] Reached bottom switch before target level"));
-                zDownRelay(false);
-                return false;
-            }
-        } else {
-            if (digitalRead(SW_Z_BOTTOM) == LOW) {
-                DBG_PRINTLN(F("[MOVE_Z] SW_Z_BOTTOM active while moving up"));
-                zUpRelay(false);
-                return false;
-            }
-            if (digitalRead(SW_Z_TOP) == LOW) {
-                DBG_PRINTLN(F("[MOVE_Z] Reached top switch before target level"));
+            if (!moveDown && isStart) {
+                DBG_PRINTLN(F("[MOVE_Z] Reached Z START before target level"));
                 zUpRelay(false);
                 return false;
             }
@@ -1751,6 +2106,44 @@ String stateToString(ProcState st) {
     }
 }
 
+String directionXToString() {
+    return dirRight ? F("right") : F("left");
+}
+
+String currentActionString() {
+    switch (g_state) {
+        case PS_IDLE: return F("Ожидание");
+        case PS_HOMING: return F("Поиск стартовой точки");
+        case PS_MOVE_X: return F("Движение по X");
+        case PS_LOWER_Z: return F("Опускание по Z");
+        case PS_HOLD: return F("Выдержка в ванне");
+        case PS_RAISE_Z: return F("Подъем по Z");
+        case PS_DRY: return F("Сушка / постобработка");
+        case PS_NEXT_STEP: return F("Переход к следующему шагу");
+        case PS_RETURN_HOME: return F("Возврат домой");
+        case PS_ERROR: return F("Ошибка / останов");
+        case PS_LEARN_BATHS: return F("Автокалибровка ванн");
+        default: return F("Неизвестно");
+    }
+}
+
+String currentWaitString() {
+    switch (g_state) {
+        case PS_IDLE: return F("Команда Старт");
+        case PS_HOMING: return F("RFID метка Start");
+        case PS_MOVE_X: return F("RFID целевой ванны");
+        case PS_LOWER_Z: return F("Z уровень / Z End / таймаут");
+        case PS_HOLD: return F("Окончание таймера выдержки");
+        case PS_RAISE_Z: return F("Z уровень / Z Start / таймаут");
+        case PS_DRY: return F("Окончание таймера сушки");
+        case PS_NEXT_STEP: return F("Следующий шаг маршрута");
+        case PS_RETURN_HOME: return F("RFID метка Start");
+        case PS_ERROR: return F("Сброс ошибки / новый старт");
+        case PS_LEARN_BATHS: return F("RFID ванны / RFID End");
+        default: return F("Неизвестно");
+    }
+}
+
 void handleBathsAutoLearn() {
     DBG_PRINTLN(F("[HTTP] POST /baths_autolearn"));
       DBG_PRINTF("Калибруем ванны...\n");
@@ -1778,6 +2171,8 @@ void handleBathsList() {
     out.reserve(2048);
     out = "{\"count\":";
     out += String(dynamicBathCount);
+    out += ",\"current_z_level\":";
+    out += String(g_currentZLevel);
     out += ",\"baths\":[";
 
     for (int i = 0; i < dynamicBathCount; ++i) {
@@ -1809,6 +2204,14 @@ void handleBathsList() {
     out += String(g_endPoint.configured ? "true" : "false");
     out += ",\"uid_hex\":\"";
     out += (g_endPoint.configured ? uidToHexString(g_endPoint.uid, g_endPoint.uidLen) : "");
+    out += "\"},\"z_start\":{\"configured\":";
+    out += String(g_zStartPoint.configured ? "true" : "false");
+    out += ",\"uid_hex\":\"";
+    out += (g_zStartPoint.configured ? uidToHexString(g_zStartPoint.uid, g_zStartPoint.uidLen) : "");
+    out += "\"},\"z_end\":{\"configured\":";
+    out += String(g_zEndPoint.configured ? "true" : "false");
+    out += ",\"uid_hex\":\"";
+    out += (g_zEndPoint.configured ? uidToHexString(g_zEndPoint.uid, g_zEndPoint.uidLen) : "");
     out += "\"}},\"z_tags\":[";
 
     for (size_t i = 0; i < g_zTags.size(); ++i) {
@@ -1861,6 +2264,74 @@ void handleBathsUpdate() {
     server.send(200, "text/plain", "OK");
 }
 
+void handleBathAdd() {
+    DBG_PRINTLN(F("[HTTP] POST /baths_add"));
+
+    if (g_state != PS_IDLE) {
+        server.send(409, "text/plain", "BUSY");
+        return;
+    }
+    if ((int)g_baths.size() >= MAX_BATHS_LIMIT) {
+        server.send(400, "text/plain", "Bath limit reached");
+        return;
+    }
+
+    uint16_t nextBathNumber = 1;
+    for (const auto &b : g_baths) {
+        if (b.bathNumber >= nextBathNumber) {
+            nextBathNumber = b.bathNumber + 1;
+        }
+    }
+
+    BathInfo b{};
+    b.bathNumber = nextBathNumber;
+    b.uidLen = 0;
+    memset(b.uid, 0, sizeof(b.uid));
+    b.isStart = false;
+    b.isEnd = false;
+    g_baths.push_back(b);
+
+    dynamicBathCount = (int)g_baths.size();
+    saveBathListToNVS();
+    server.send(200, "text/plain", "OK");
+}
+
+void handleBathDelete() {
+    DBG_PRINTLN(F("[HTTP] POST /baths_delete"));
+
+    if (g_state != PS_IDLE) {
+        server.send(409, "text/plain", "BUSY");
+        return;
+    }
+    if (!server.hasArg("index")) {
+        server.send(400, "text/plain", "index required");
+        return;
+    }
+
+    int idx = server.arg("index").toInt();
+    if (idx < 0 || idx >= (int)g_baths.size()) {
+        server.send(400, "text/plain", "bad index");
+        return;
+    }
+
+    g_baths.erase(g_baths.begin() + idx);
+    dynamicBathCount = (int)g_baths.size();
+
+    if (dynamicBathCount <= 0) {
+        bathIndex = 0;
+        shadowBath = 0;
+        g_currentBath = 0;
+    } else {
+        if (bathIndex >= dynamicBathCount) bathIndex = dynamicBathCount - 1;
+        if (shadowBath >= dynamicBathCount) shadowBath = dynamicBathCount - 1;
+        if (shadowBath < 0) shadowBath = 0;
+        g_currentBath = getBathDisplayNumberByIndex(bathIndex);
+    }
+
+    saveBathListToNVS();
+    server.send(200, "text/plain", "OK");
+}
+
 void handleServicePointLearn() {
     DBG_PRINTLN(F("[HTTP] POST /service_point_learn"));
     if (!server.hasArg("kind")) {
@@ -1870,27 +2341,51 @@ void handleServicePointLearn() {
 
     String kind = server.arg("kind");
     ServicePointInfo *target = nullptr;
-    if (kind == "start") target = &g_startPoint;
-    if (kind == "end") target = &g_endPoint;
-    if (!target) {
-        server.send(400, "text/plain", "kind must be start or end");
-        return;
-    }
+
+    DBG_PRINTF("[RFID] service learn requested for kind=%s\r\n", kind.c_str());
 
     uint8_t uid[7] = {0};
     uint8_t uidLen = 0;
-    uint32_t t0 = millis();
-    while (millis() - t0 < 5000UL) {
-        if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen)) {
-            setServicePoint(*target, uid, uidLen);
-            saveServicePointToNVS(kind == "start" ? NVS_KEY_START_POINT : NVS_KEY_END_POINT, *target);
-            noteLastDetected(kind == "start" ? LDK_START : LDK_END, -1, uid, uidLen);
+    Adafruit_PN532 *reader = &nfcX;
+    bool readerReady = nfcXReady;
+    const char *saveKey = nullptr;
+    if (kind == "start") {
+        target = &g_startPoint;
+        saveKey = NVS_KEY_START_POINT;
+    } else if (kind == "end") {
+        target = &g_endPoint;
+        saveKey = NVS_KEY_END_POINT;
+    } else if (kind == "z_start") {
+        target = &g_zStartPoint;
+        saveKey = NVS_KEY_Z_START_POINT;
+        reader = &nfcZ;
+        readerReady = nfcZReady;
+    } else if (kind == "z_end") {
+        target = &g_zEndPoint;
+        saveKey = NVS_KEY_Z_END_POINT;
+        reader = &nfcZ;
+        readerReady = nfcZReady;
+    }
 
-            String resp = "{\"ok\":true,\"kind\":\"" + kind + "\",\"uid_hex\":\"" + uidToHexString(uid, uidLen) + "\"}";
-            server.send(200, "application/json", resp);
-            return;
-        }
-        delay(50);
+    if (!target || !saveKey) {
+        server.send(400, "text/plain", "invalid kind");
+        return;
+    }
+
+    if (readUidWithTimeout(*reader, readerReady, kind.c_str(), uid, &uidLen, 5000UL)) {
+        setServicePoint(*target, uid, uidLen);
+        saveServicePointToNVS(saveKey, *target);
+        uint8_t detectedKind =
+            kind == "start" ? LDK_START :
+            kind == "end" ? LDK_END :
+            kind == "z_start" ? LDK_Z_START : LDK_Z_END;
+        noteLastDetected(detectedKind, -1, uid, uidLen);
+        DBG_PRINTF("[RFID] service point %s saved to NVS\r\n", kind.c_str());
+        waitForTagRelease(*reader, readerReady, kind.c_str(), 1500UL);
+
+        String resp = "{\"ok\":true,\"kind\":\"" + kind + "\",\"uid_hex\":\"" + uidToHexString(uid, uidLen) + "\"}";
+        server.send(200, "application/json", resp);
+        return;
     }
 
     server.send(408, "application/json", "{\"ok\":false,\"error\":\"timeout: tag not detected\"}");
@@ -1904,36 +2399,211 @@ void handleZTagLearn() {
     }
 
     int16_t level = (int16_t)server.arg("level").toInt();
+    DBG_PRINTF("[RFID] Z learn requested for level=%d\r\n", (int)level);
     uint8_t uid[7] = {0};
     uint8_t uidLen = 0;
-    uint32_t t0 = millis();
-    while (millis() - t0 < 5000UL) {
-        if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen)) {
-            int existingIdx = findZTagIndexByLevel(level);
-            ZTagInfo z{};
-            z.level = level;
-            z.uidLen = uidLen > 7 ? 7 : uidLen;
-            memcpy(z.uid, uid, z.uidLen);
+    if (readUidWithTimeout(nfcZ, nfcZReady, "z_level", uid, &uidLen, 5000UL)) {
+        int existingIdx = findZTagIndexByLevel(level);
+        ZTagInfo z{};
+        z.level = level;
+        z.uidLen = uidLen > 7 ? 7 : uidLen;
+        memcpy(z.uid, uid, z.uidLen);
 
-            if (existingIdx >= 0) g_zTags[existingIdx] = z;
-            else if ((int)g_zTags.size() < MAX_BATHS_LIMIT) g_zTags.push_back(z);
-
-            saveZTagsToNVS();
-            g_currentZLevel = level;
-            noteLastDetected(LDK_Z_LEVEL, level, uid, uidLen);
-
-            String resp = "{\"ok\":true,\"level\":";
-            resp += String(level);
-            resp += ",\"uid_hex\":\"";
-            resp += uidToHexString(uid, uidLen);
-            resp += "\"}";
-            server.send(200, "application/json", resp);
-            return;
+        if (existingIdx >= 0) {
+            DBG_PRINTF("[RFID] replacing existing Z tag at index=%d\r\n", existingIdx);
+            g_zTags[existingIdx] = z;
+        } else if ((int)g_zTags.size() < MAX_BATHS_LIMIT) {
+            DBG_PRINTF("[RFID] adding new Z tag, count before=%u\r\n", (unsigned)g_zTags.size());
+            g_zTags.push_back(z);
         }
-        delay(50);
+
+        saveZTagsToNVS();
+        g_currentZLevel = level;
+        noteLastDetected(LDK_Z_LEVEL, level, uid, uidLen);
+        DBG_PRINTF("[RFID] Z level %d saved to NVS\r\n", (int)level);
+        waitForTagRelease(nfcZ, nfcZReady, "z_level", 1500UL);
+
+        String resp = "{\"ok\":true,\"level\":";
+        resp += String(level);
+        resp += ",\"uid_hex\":\"";
+        resp += uidToHexString(uid, uidLen);
+        resp += "\"}";
+        server.send(200, "application/json", resp);
+        return;
     }
 
     server.send(408, "application/json", "{\"ok\":false,\"error\":\"timeout: tag not detected\"}");
+}
+
+void handleZAutoLearn() {
+    DBG_PRINTLN(F("[HTTP] POST /z_autolearn"));
+
+    if (g_state != PS_IDLE) {
+        server.send(409, "text/plain", "BUSY");
+        return;
+    }
+    if (!nfcZReady) {
+        server.send(500, "text/plain", "Z reader not ready");
+        return;
+    }
+
+    int16_t startLevel = 0;
+    if (server.hasArg("start")) {
+        startLevel = (int16_t)server.arg("start").toInt();
+    }
+    DBG_PRINTF("[Z-AUTO] startLevel=%d\r\n", (int)startLevel);
+
+    std::vector<ZTagInfo> oldTags = g_zTags;
+    int16_t oldLevel = g_currentZLevel;
+
+    if (!g_zStartPoint.configured || !g_zEndPoint.configured) {
+        server.send(500, "application/json", "{\"ok\":false,\"error\":\"z start/end not configured\"}");
+        return;
+    }
+    if (servicePointMatches(g_zStartPoint, g_zEndPoint.uid, g_zEndPoint.uidLen)) {
+        server.send(500, "application/json", "{\"ok\":false,\"error\":\"z start/end identical\"}");
+        return;
+    }
+
+    DBG_PRINTLN(F("[Z-AUTO] moving to Z START before scan"));
+    if (!moveToZStartPoint(30000)) {
+        server.send(500, "application/json", "{\"ok\":false,\"error\":\"cannot reach z start\"}");
+        return;
+    }
+
+    g_zTags.clear();
+    g_currentZLevel = -1;
+
+    uint8_t lastUid[7] = {0};
+    uint8_t lastLen = 0;
+    int stable = 0;
+    int16_t nextLevel = startLevel;
+    const uint32_t t0 = millis();
+    const uint32_t timeoutMs = 60000UL;
+    bool leftStartZone = false;
+
+    zUpRelay(false);
+    zDownRelay(true);
+
+    while (millis() - t0 < timeoutMs) {
+        if (digitalRead(PIN_ESTOP) == LOW || g_stopCommand) {
+            DBG_PRINTLN(F("[Z-AUTO] interrupted by stop/ESTOP"));
+            zDownRelay(false);
+            g_zTags = oldTags;
+            g_currentZLevel = oldLevel;
+            server.send(500, "application/json", "{\"ok\":false,\"error\":\"stopped\"}");
+            return;
+        }
+
+        uint8_t uid[7] = {0};
+        uint8_t uidLen = 0;
+        if (readPassiveTargetZ(uid, &uidLen)) {
+            bool isStart = false, isEnd = false;
+            captureKnownZServicePoint(uid, uidLen, isStart, isEnd);
+
+            if (isStart) {
+                if (!leftStartZone) {
+                    vTaskDelay(40 / portTICK_PERIOD_MS);
+                    continue;
+                }
+                DBG_PRINTLN(F("[Z-AUTO] Z START detected again after leaving start zone"));
+                zDownRelay(false);
+                g_zTags = oldTags;
+                g_currentZLevel = oldLevel;
+                server.send(500, "application/json", "{\"ok\":false,\"error\":\"z start detected again\"}");
+                return;
+            }
+
+            if (isEnd) {
+                DBG_PRINTLN(F("[Z-AUTO] Z END reached"));
+                break;
+            }
+
+            leftStartZone = true;
+
+            if (uidLen == lastLen && uidEquals(uid, lastUid, uidLen)) {
+                stable++;
+            } else {
+                memcpy(lastUid, uid, uidLen);
+                lastLen = uidLen;
+                stable = 1;
+            }
+
+            if (stable >= 2) {
+                stable = 0;
+                lastLen = 0;
+                memset(lastUid, 0, sizeof(lastUid));
+
+                int existingIdx = findZTagIndexByUID(uid, uidLen);
+                if (existingIdx < 0) {
+                    ZTagInfo z{};
+                    z.level = nextLevel++;
+                    z.uidLen = uidLen > 7 ? 7 : uidLen;
+                    memcpy(z.uid, uid, z.uidLen);
+                    g_zTags.push_back(z);
+                    g_currentZLevel = z.level;
+                    noteLastDetected(LDK_Z_LEVEL, z.level, uid, uidLen);
+                    DBG_PRINTF("[Z-AUTO] learned Z level=%d count=%u\r\n",
+                               (int)z.level,
+                               (unsigned)g_zTags.size());
+                    debugPrintUid("[Z-AUTO] UID", uid, uidLen);
+                    waitForTagRelease(nfcZ, nfcZReady, "z_auto", 1200UL);
+                }
+            }
+        }
+
+        vTaskDelay(20 / portTICK_PERIOD_MS);
+    }
+
+    zDownRelay(false);
+
+    if (g_zTags.empty()) {
+        DBG_PRINTLN(F("[Z-AUTO] no Z tags found, restoring old config"));
+        g_zTags = oldTags;
+        g_currentZLevel = oldLevel;
+        moveToZStartPoint(30000);
+        server.send(500, "application/json", "{\"ok\":false,\"error\":\"no z tags found\"}");
+        return;
+    }
+
+    saveZTagsToNVS();
+    DBG_PRINTF("[Z-AUTO] saved %u Z tags\r\n", (unsigned)g_zTags.size());
+
+    DBG_PRINTLN(F("[Z-AUTO] returning to Z START"));
+    moveToZStartPoint(30000);
+
+    String resp = "{\"ok\":true,\"count\":";
+    resp += String((int)g_zTags.size());
+    resp += ",\"start_level\":";
+    resp += String(startLevel);
+    resp += "}";
+    server.send(200, "application/json", resp);
+}
+
+void handleZTagDelete() {
+    DBG_PRINTLN(F("[HTTP] POST /z_tag_delete"));
+
+    if (g_state != PS_IDLE) {
+        server.send(409, "text/plain", "BUSY");
+        return;
+    }
+    if (!server.hasArg("level")) {
+        server.send(400, "text/plain", "level required");
+        return;
+    }
+
+    int16_t level = (int16_t)server.arg("level").toInt();
+    int idx = findZTagIndexByLevel(level);
+    if (idx < 0) {
+        server.send(404, "text/plain", "level not found");
+        return;
+    }
+
+    DBG_PRINTF("[RFID] deleting Z level=%d at index=%d\r\n", (int)level, idx);
+    g_zTags.erase(g_zTags.begin() + idx);
+    if (g_currentZLevel == level) g_currentZLevel = -1;
+    saveZTagsToNVS();
+    server.send(200, "text/plain", "OK");
 }
 void handleBathsLearn() {
     DBG_PRINTLN(F("[HTTP] POST /baths_learn"));
@@ -1970,20 +2640,8 @@ void handleBathsLearn() {
 
     uint8_t uid[7] = {0};
     uint8_t uidLen = 0;
-
-    // ждём метку до 5 секунд
-    uint32_t t0 = millis();
-    bool success = false;
-
-    while (millis() - t0 < 5000UL) {
-        if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen)) {
-            success = true;
-            break;
-        }
-        delay(50);
-    }
-
-    if (!success) {
+    DBG_PRINTF("[RFID] bath learn requested for storage index=%d\r\n", idx);
+    if (!readUidWithTimeout(nfcX, nfcXReady, "bath", uid, &uidLen, 5000UL)) {
         server.send(408, "application/json",
                     "{\"ok\":false,\"error\":\"timeout: tag not detected\"}");
         return;
@@ -2000,8 +2658,11 @@ void handleBathsLearn() {
     b.uidLen = uidLen;
     memset(b.uid, 0, sizeof(b.uid));
     memcpy(b.uid, uid, uidLen);
+    DBG_PRINTF("[RFID] bath index=%d assigned bathNumber=%u\r\n", idx, b.bathNumber);
+    debugPrintUid("[RFID] bath saved UID", uid, uidLen);
 
     saveBathListToNVS();
+    waitForTagRelease(nfcX, nfcXReady, "bath", 1500UL);
 
     String resp;
     resp.reserve(128);
@@ -2221,9 +2882,20 @@ void uidToHex(const uint8_t* uid, uint8_t len, char* out) {
 }
 void handleStatus() {
     StaticJsonDocument<6144> doc;
+    const Step *curStep = (g_stepIdx >= 0 && g_stepIdx < g_routeSteps) ? &g_route[g_stepIdx] : nullptr;
+    const bool spinRequested = curStep ? ((curStep->flags & 1) != 0) : false;
+    const bool fanRequested = curStep ? ((curStep->flags & 2) != 0) : false;
+    const bool spinActive = digitalRead(REL_SPIN) == ON;
+    const bool fanActive = digitalRead(REL_FAN) == ON;
+    const bool xFwdActive = digitalRead(REL_X_FWD) == ON;
+    const bool xRevActive = digitalRead(REL_X_REV) == ON;
+    const bool zUpActive = digitalRead(REL_Z_UP) == ON;
+    const bool zDownActive = digitalRead(REL_Z_DOWN) == ON;
 
     doc["state"] = g_state;
     doc["state_str"] = stateToString(g_state);
+    doc["action"] = currentActionString();
+    doc["waiting_for"] = currentWaitString();
     doc["time"] = rtcTimeString();
     doc["date"] = rtcDateString();
     doc["bath"] = g_currentBath;
@@ -2231,6 +2903,36 @@ void handleStatus() {
     doc["step_idx"] = g_stepIdx;
     doc["steps"] = g_routeSteps;
     doc["active_route"] = getActiveRouteId();
+    doc["target_bath"] = g_targetBath;
+    doc["target_z_level"] = curStep ? (g_state == PS_RAISE_Z ? curStep->z_level_up : curStep->z_level_down) : -1;
+    doc["direction_x"] = directionXToString();
+    doc["spin_requested"] = spinRequested;
+    doc["fan_requested"] = fanRequested;
+    doc["spin_active"] = spinActive;
+    doc["fan_active"] = fanActive;
+    doc["x_reader_ready"] = nfcXReady;
+    doc["z_reader_ready"] = nfcZReady;
+
+    JsonObject relays = doc.createNestedObject("relays");
+    relays["x_fwd"] = xFwdActive;
+    relays["x_rev"] = xRevActive;
+    relays["z_up"] = zUpActive;
+    relays["z_down"] = zDownActive;
+    relays["spin"] = spinActive;
+    relays["fan"] = fanActive;
+
+    if (curStep) {
+        JsonObject step = doc.createNestedObject("current_step");
+        step["bath"] = curStep->bath;
+        step["z_level_down"] = curStep->z_level_down;
+        step["z_down_timeout_s"] = curStep->z_down_timeout_s;
+        step["hold_s"] = curStep->hold_s;
+        step["z_level_up"] = curStep->z_level_up;
+        step["z_up_timeout_s"] = curStep->z_up_timeout_s;
+        step["dry_s"] = curStep->dry_s;
+        step["spin"] = spinRequested;
+        step["fan"] = fanRequested;
+    }
 
     // Количество ванн в текущей калибровке
     doc["learn_count"] = dynamicBathCount;
@@ -2245,6 +2947,12 @@ void handleStatus() {
     JsonObject spEnd = sp.createNestedObject("end");
     spEnd["configured"] = g_endPoint.configured;
     spEnd["uid"] = g_endPoint.configured ? uidToHexString(g_endPoint.uid, g_endPoint.uidLen) : "";
+    JsonObject spZStart = sp.createNestedObject("z_start");
+    spZStart["configured"] = g_zStartPoint.configured;
+    spZStart["uid"] = g_zStartPoint.configured ? uidToHexString(g_zStartPoint.uid, g_zStartPoint.uidLen) : "";
+    JsonObject spZEnd = sp.createNestedObject("z_end");
+    spZEnd["configured"] = g_zEndPoint.configured;
+    spZEnd["uid"] = g_zEndPoint.configured ? uidToHexString(g_zEndPoint.uid, g_zEndPoint.uidLen) : "";
 
     JsonArray zTags = doc.createNestedArray("z_tags");
     for (const auto &z : g_zTags) {
@@ -2260,6 +2968,8 @@ void handleStatus() {
         last["kind_str"] =
             g_lastDetected.kind == LDK_START ? "start" :
             g_lastDetected.kind == LDK_END ? "end" :
+            g_lastDetected.kind == LDK_Z_START ? "z_start" :
+            g_lastDetected.kind == LDK_Z_END ? "z_end" :
             g_lastDetected.kind == LDK_Z_LEVEL ? "z_level" : "process";
         last["index"] = g_lastDetected.number;
         last["isStart"] = g_lastDetected.kind == LDK_START;
@@ -2286,6 +2996,46 @@ void handleStatus() {
     server.send(200, "application/json", out);
 }
 
+void handleActionLog() {
+    StaticJsonDocument<16384> doc;
+    JsonArray arr = doc.createNestedArray("items");
+
+    size_t start = (g_actionLogCount == ACTION_LOG_CAPACITY) ? g_actionLogHead : 0;
+    for (size_t i = 0; i < g_actionLogCount; ++i) {
+        size_t idx = (start + i) % ACTION_LOG_CAPACITY;
+        const ActionLogEntry &e = g_actionLog[idx];
+        JsonObject o = arr.createNestedObject();
+        o["seq"] = e.seq;
+        o["date"] = e.date;
+        o["time"] = e.time;
+        o["level"] = e.level;
+        o["category"] = e.category;
+        o["message"] = e.message;
+    }
+
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
+}
+
+void handleActionLogCsv() {
+    String out = "seq,date,time,level,category,message\r\n";
+    size_t start = (g_actionLogCount == ACTION_LOG_CAPACITY) ? g_actionLogHead : 0;
+    for (size_t i = 0; i < g_actionLogCount; ++i) {
+        size_t idx = (start + i) % ACTION_LOG_CAPACITY;
+        const ActionLogEntry &e = g_actionLog[idx];
+        String msg = e.message;
+        msg.replace("\"", "\"\"");
+        out += String(e.seq) + ",";
+        out += "\"" + e.date + "\",";
+        out += "\"" + e.time + "\",";
+        out += "\"" + e.level + "\",";
+        out += "\"" + e.category + "\",";
+        out += "\"" + msg + "\"\r\n";
+    }
+    server.send(200, "text/csv; charset=utf-8", out);
+}
+
 bool activeRouteIsExecutable() {
     if (g_routeSteps == 0) return false;
     if (!g_startPoint.configured) return false;
@@ -2305,9 +3055,11 @@ void handleStart() {
     if (g_state == PS_IDLE && activeRouteIsExecutable()) {
         g_startCommand = true;
         DBG_PRINTLN(F("[HTTP]   startCommand set"));
+        addActionLog("info", "command", "Получена команда START");
         server.send(200, "text/plain", "OK");
     } else {
         DBG_PRINTLN(F("[HTTP]   BUSY or route config invalid"));
+        addActionLog("warn", "command", "START отклонен: линия занята или маршрут невалиден");
         server.send(409, "text/plain", "BUSY or invalid route/start config");
     }
 }
@@ -2315,6 +3067,8 @@ void handleStart() {
 void handleStop() {
     DBG_PRINTLN(F("[HTTP] POST /stop"));
     g_stopCommand = true;
+    g_startCommand = false;
+    addActionLog("warn", "command", "Получена команда STOP");
     server.send(200, "text/plain", "STOP requested");
 }
 
@@ -2439,6 +3193,10 @@ void setState(ProcState newState, const char* reason) {
                    (int)prev,
                    (int)newState,
                    reason ? reason : "");
+        addActionLog(newState == PS_ERROR ? "error" : "info",
+                     "state",
+                     stateToString(prev) + " -> " + stateToString(newState) +
+                     (reason && reason[0] ? String(" (") + reason + ")" : ""));
         prev = newState;
     }
     g_state = newState;
@@ -2475,7 +3233,8 @@ void TaskProcess(void* pv) {
             DBG_PRINTLN(F("[TASK] stopCommand received"));
             g_stopCommand = false;
             relOffAll();
-            setState(PS_ERROR, "STOP command");
+            g_stepIdx = -1;
+            setState(PS_IDLE, "STOP command");
         }
 
         switch (g_state) {
@@ -2513,112 +3272,157 @@ case PS_LEARN_BATHS: {
         setState(PS_ERROR, "No start/end service point");
         break;
     }
+    if (servicePointMatches(g_startPoint, g_endPoint.uid, g_endPoint.uidLen)) {
+        DBG_PRINTLN("[LEARN] ERROR: start and end points are identical");
+        setState(PS_ERROR, "Start/end are identical");
+        break;
+    }
 
-    // --- 1. Очистить таблицу ---
-    g_baths.clear();
-    dynamicBathCount = 0;
+    std::vector<BathInfo> oldBaths = g_baths;
+    int oldDynamicBathCount = dynamicBathCount;
+
     noteLastDetected(LDK_NONE, -1, nullptr, 0);
 
-    // --- 2. Подготовка переменных ---
+    DBG_PRINTLN("[LEARN] Moving to START point before scan...");
+    if (!moveToStartPoint(30000)) {
+        DBG_PRINTLN("[LEARN] ERROR: cannot reach START point");
+        setState(PS_ERROR, "Cannot reach START");
+        break;
+    }
+
+    g_baths.clear();
+    dynamicBathCount = 0;
+    noteLastDetected(LDK_START, -1, g_startPoint.uid, g_startPoint.uidLen);
+    oledShowLearn(0, g_startPoint.uid, g_startPoint.uidLen);
+
     uint8_t lastUid[7] = {0};
     uint8_t lastLen = 0;
     int stable = 0;
-    bool startSeen = false;
+    bool leftStartZone = false;
+    bool learnSucceeded = false;
+    const uint32_t learnTimeoutMs = 120000UL;
+    const uint32_t tLearn0 = millis();
 
-    // --- 3. Начать движение ---
     xRev(false);
     xFwd(true);
 
-    oledShowLearn(0, nullptr, 0);
-
-    while (true)
-    {
-        // аварийный стоп
-        if (digitalRead(PIN_ESTOP)==LOW || g_stopCommand) {
+    while (millis() - tLearn0 < learnTimeoutMs) {
+        if (digitalRead(PIN_ESTOP) == LOW || g_stopCommand) {
             xFwd(false);
+            xRev(false);
+            g_baths = oldBaths;
+            dynamicBathCount = oldDynamicBathCount;
             setState(PS_ERROR, "LEARN stopped");
             break;
         }
 
-        uint8_t uid[7];
-        uint8_t uidLen;
-        bool ok = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen);
-
-        if (ok && uidLen>0) {
-
-            // антидребезг
-            if (uidLen == lastLen && uidEquals(uid, lastUid, uidLen))
-                stable++;
-            else {
-                memcpy(lastUid, uid, uidLen);
-                lastLen = uidLen;
-                stable = 1;
-            }
-
-            if (stable >= 2) {
-                if (servicePointMatches(g_startPoint, uid, uidLen)) {
-                    startSeen = true;
-                    noteLastDetected(LDK_START, -1, uid, uidLen);
-                    oledShowLearn(dynamicBathCount, uid, uidLen);
-                    vTaskDelay(80 / portTICK_PERIOD_MS);
-                    continue;
-                }
-
-                if (servicePointMatches(g_endPoint, uid, uidLen)) {
-                    noteLastDetected(LDK_END, -1, uid, uidLen);
-                    oledShowLearn(dynamicBathCount, uid, uidLen);
-                    DBG_PRINTLN("[LEARN] END service point detected!");
-                    xFwd(false);
-                    goto LEARN_DONE;
-                }
-
-                if (!startSeen) {
-                    // До стартовой точки не считаем рабочие ванны.
-                    vTaskDelay(80 / portTICK_PERIOD_MS);
-                    continue;
-                }
-
-                // проверяем — новая ли это рабочая ванна
-                int idx = findBathIndexByUID(uid, uidLen);
-                if (idx < 0) {
-                    BathInfo b{};
-                    b.bathNumber = dynamicBathCount + 1;
-                    b.uidLen = uidLen;
-                    memcpy(b.uid, uid, uidLen);
-                    b.isStart = false;
-                    b.isEnd   = false;
-
-                    g_baths.push_back(b);
-                    dynamicBathCount++;
-                    noteLastDetected(LDK_PROCESS, b.bathNumber, uid, uidLen);
-
-                    DBG_PRINTF("[LEARN] NEW BATH %d — UID: ", b.bathNumber);
-                    for (int i=0;i<uidLen;i++) DBG_PRINTF("%02X ", uid[i]);
-                    DBG_PRINTLN("");
-                } else {
-                    noteLastDetected(LDK_PROCESS, g_baths[idx].bathNumber, uid, uidLen);
-                }
-
-                // показать на OLED
-                oledShowLearn(dynamicBathCount, uid, uidLen);
-            }
+        uint8_t uid[7] = {0};
+        uint8_t uidLen = 0;
+        bool ok = readPassiveTargetX(uid, &uidLen);
+        if (!ok || uidLen == 0) {
+            vTaskDelay(20 / portTICK_PERIOD_MS);
+            continue;
         }
 
-        vTaskDelay(20 / portTICK_PERIOD_MS);
+        if (uidLen == lastLen && uidEquals(uid, lastUid, uidLen)) {
+            stable++;
+        } else {
+            memcpy(lastUid, uid, uidLen);
+            lastLen = uidLen;
+            stable = 1;
+        }
+
+        if (stable < 2) {
+            vTaskDelay(20 / portTICK_PERIOD_MS);
+            continue;
+        }
+
+        // consume this tag once, then wait for the next stable read
+        stable = 0;
+        lastLen = 0;
+        memset(lastUid, 0, sizeof(lastUid));
+
+        if (servicePointMatches(g_startPoint, uid, uidLen)) {
+            noteLastDetected(LDK_START, -1, uid, uidLen);
+            oledShowLearn(dynamicBathCount, uid, uidLen);
+            if (!leftStartZone) {
+                vTaskDelay(80 / portTICK_PERIOD_MS);
+                continue;
+            }
+
+            DBG_PRINTLN("[LEARN] START point detected again after leaving start zone");
+            xFwd(false);
+            xRev(false);
+            g_baths = oldBaths;
+            dynamicBathCount = oldDynamicBathCount;
+            setState(PS_ERROR, "Start detected again");
+            break;
+        }
+
+        leftStartZone = true;
+
+        if (servicePointMatches(g_endPoint, uid, uidLen)) {
+            noteLastDetected(LDK_END, -1, uid, uidLen);
+            oledShowLearn(dynamicBathCount, uid, uidLen);
+            DBG_PRINTLN("[LEARN] END service point detected");
+            xFwd(false);
+            xRev(false);
+            learnSucceeded = true;
+            break;
+        }
+
+        int idx = findBathIndexByUID(uid, uidLen);
+        if (idx < 0) {
+            BathInfo b{};
+            b.bathNumber = dynamicBathCount + 1;
+            b.uidLen = uidLen;
+            memcpy(b.uid, uid, uidLen);
+            b.isStart = false;
+            b.isEnd   = false;
+
+            g_baths.push_back(b);
+            dynamicBathCount = (int)g_baths.size();
+            noteLastDetected(LDK_PROCESS, b.bathNumber, uid, uidLen);
+
+            DBG_PRINTF("[LEARN] NEW BATH %d UID: ", b.bathNumber);
+            for (int i = 0; i < uidLen; i++) DBG_PRINTF("%02X ", uid[i]);
+            DBG_PRINTLN("");
+        } else {
+            noteLastDetected(LDK_PROCESS, g_baths[idx].bathNumber, uid, uidLen);
+        }
+
+        oledShowLearn(dynamicBathCount, uid, uidLen);
+        vTaskDelay(80 / portTICK_PERIOD_MS);
     }
 
-LEARN_DONE:
+    if (learnSucceeded) {
+        if (dynamicBathCount <= 0) {
+            DBG_PRINTLN("[LEARN] ERROR: no baths found between START and END");
+            g_baths = oldBaths;
+            dynamicBathCount = oldDynamicBathCount;
+            setState(PS_ERROR, "No baths found");
+            break;
+        }
 
-    DBG_PRINTLN("[LEARN] Learning finished, saving...");
+        DBG_PRINTLN("[LEARN] Learning finished, saving...");
+        saveBathListToNVS();
 
-    saveBathListToNVS();
+        DBG_PRINTLN("[LEARN] Returning Home...");
+        moveToStartPoint(30000);
+        setState(PS_IDLE, "Learn done");
+        break;
+    }
 
-    DBG_PRINTLN("[LEARN] Returning Home...");
-    moveToStartPoint(30000);
-
-    setState(PS_IDLE, "Learn done");
+    if (g_state != PS_ERROR) {
+        DBG_PRINTLN("[LEARN] ERROR: timeout waiting for END point");
+        xFwd(false);
+        xRev(false);
+        g_baths = oldBaths;
+        dynamicBathCount = oldDynamicBathCount;
+        setState(PS_ERROR, "Learn timeout");
+    }
     break;
-} 
+}
 
 break;
 
@@ -2729,50 +3533,88 @@ break;
 void TaskUI(void* pv) {
     (void)pv;
     DBG_PRINTLN(F("[TASK] TaskUI started"));
+    uint32_t lastUiHeartbeat = 0;
     for (;;) {
-       if (g_inSelectMenu) {
-
-    // Меню выбора — разрешаем рисовать
-    oledShowSelectMenu();
-
-    int d = getEncDelta();
-    if (d != 0) {
-        g_selectedRoute += d;
-        if (g_selectedRoute < 0) g_selectedRoute = ROUTE_SLOTS - 1;
-        if (g_selectedRoute >= ROUTE_SLOTS) g_selectedRoute = 0;
-    }
-
-    if (startButtonPressed()) {
-        if (loadRouteSlot((uint8_t)g_selectedRoute)) {}
-        g_inSelectMenu = false;
-    }
-
-} 
-else if (g_state == PS_LEARN_BATHS) {
-
-    // <<< ВАЖНО! НИЧЕГО НЕ РИСУЕМ ВО ВРЕМЯ LEARN
-    // oledShowLearn вызывается только из TaskProcess
-    // Здесь — ПОЛНАЯ ТИШИНА
-    vTaskDelay(100);
-
-} 
-else {
-    // обычные экраны
-    if (g_state == PS_IDLE) {
-        oledShowIdle();
-
-        if (startButtonPressed() && activeRouteIsExecutable()) {
-            g_startCommand = true;
+        if (!oledReady) {
+            vTaskDelay(250 / portTICK_PERIOD_MS);
+            continue;
         }
-
-        if (getEncDelta() != 0) {
-            g_inSelectMenu = true;
+        if (millis() - lastUiHeartbeat >= 5000UL) {
+            lastUiHeartbeat = millis();
+            DBG_PRINTF("[UI] heartbeat state=%d mode=%d oled=%d X=%d Z=%d\r\n",
+                       (int)g_state, (int)g_uiMode, (int)oledReady, (int)nfcXReady, (int)nfcZReady);
         }
-    } else {
-        oledShowRun();
-    }
-}
+        if (g_state == PS_LEARN_BATHS) {
 
+            // <<< ВАЖНО! НИЧЕГО НЕ РИСУЕМ ВО ВРЕМЯ LEARN
+            // oledShowLearn вызывается только из TaskProcess
+            vTaskDelay(100);
+        } else if (g_state != PS_IDLE) {
+            oledShowRun();
+        } else {
+            int d = getEncDelta();
+            bool encPress = encoderButtonPressed();
+            bool startPress = startButtonPressed();
+
+            switch (g_uiMode) {
+                case UI_HOME:
+                    oledShowIdle();
+
+                    if (startPress && activeRouteIsExecutable()) {
+                        g_startCommand = true;
+                    }
+
+                    if (encPress) {
+                        g_uiMode = UI_MAIN_MENU;
+                        g_menuIndex = 0;
+                    }
+                    break;
+
+                case UI_MAIN_MENU:
+                    oledShowMainMenu();
+                    if (d != 0) {
+                        g_menuIndex += d;
+                        if (g_menuIndex < 0) g_menuIndex = 2;
+                        if (g_menuIndex > 2) g_menuIndex = 0;
+                    }
+                    if (encPress) {
+                        if (g_menuIndex == 0) {
+                            if (activeRouteIsExecutable()) {
+                                g_startCommand = true;
+                                g_uiMode = UI_HOME;
+                            }
+                        } else if (g_menuIndex == 1) {
+                            g_uiMode = UI_ROUTE_SELECT;
+                        } else {
+                            g_uiMode = UI_SETTINGS;
+                        }
+                    }
+                    break;
+
+                case UI_ROUTE_SELECT:
+                    oledShowSelectMenu();
+                    if (d != 0) {
+                        g_selectedRoute += d;
+                        if (g_selectedRoute < 0) g_selectedRoute = ROUTE_SLOTS - 1;
+                        if (g_selectedRoute >= ROUTE_SLOTS) g_selectedRoute = 0;
+                    }
+                    if (encPress) {
+                        loadRouteSlot((uint8_t)g_selectedRoute);
+                        g_uiMode = UI_HOME;
+                    }
+                    if (startPress) {
+                        g_uiMode = UI_MAIN_MENU;
+                    }
+                    break;
+
+                case UI_SETTINGS:
+                    oledShowSettings();
+                    if (encPress || startPress) {
+                        g_uiMode = UI_MAIN_MENU;
+                    }
+                    break;
+            }
+        }
 
         vTaskDelay(150 / portTICK_PERIOD_MS);
     }
@@ -2797,10 +3639,7 @@ void setup() {
     Wire.begin(I2C_SDA, I2C_SCL);  // 1) запускаем шину I2C
 
     oledInit();    // 2) OLED ОБЯЗАТЕЛЬНО первым
-
-    Serial.println("DEBUG: calling nfcInit()");
-
-    nfcInit();     // 3) потом PN532
+    DBG_PRINTLN(F("[SETUP] OLED init complete"));
 
     // =============== NFC TEST MODE ===============
 // Если удерживать кнопку START при включении — входим в NFC TEST MODE
@@ -2815,25 +3654,12 @@ void setup() {
     loadBathListFromNVS();     // загрузка ванн из NVS
     loadServicePointFromNVS(NVS_KEY_START_POINT, g_startPoint);
     loadServicePointFromNVS(NVS_KEY_END_POINT, g_endPoint);
+    loadServicePointFromNVS(NVS_KEY_Z_START_POINT, g_zStartPoint);
+    loadServicePointFromNVS(NVS_KEY_Z_END_POINT, g_zEndPoint);
     loadZTagsFromNVS();
     migrateLegacyServiceFlagsIfNeeded();
 
-    // Если хочешь гарантированный минимум "логических" ванн – можно создать пустые слоты
-    if (dynamicBathCount < MIN_BATHS) {
-        for (int i = dynamicBathCount; i < MIN_BATHS; ++i) {
-            if ((int)g_baths.size() >= MAX_BATHS_LIMIT) break;
-            BathInfo b;
-            b.bathNumber = (uint16_t)(i + 1);
-            b.uidLen     = 0;
-            memset(b.uid, 0, sizeof(b.uid));
-            b.isStart = false;
-            b.isEnd   = false;
-            g_baths.push_back(b);
-        }
-        dynamicBathCount = (int)g_baths.size();
-        saveBathListToNVS();
-    }
-    
+    dynamicBathCount = (int)g_baths.size();
 
     Serial.printf("[SETUP] dynamicBathCount = %d\n", dynamicBathCount);
 
@@ -2917,6 +3743,8 @@ DBG_PRINTLN(F("[SETUP] HTTP routes init"));
 
 server.on("/", HTTP_GET, handleRoot);
 server.on("/status", HTTP_GET, handleStatus);
+server.on("/action_log", HTTP_GET, handleActionLog);
+server.on("/action_log.csv", HTTP_GET, handleActionLogCsv);
 server.on("/start", HTTP_POST, handleStart);
 server.on("/stop", HTTP_POST, handleStop);
 server.on("/route", HTTP_POST, handleRoutePost);
@@ -2933,9 +3761,13 @@ server.on("/route_apply", HTTP_POST, handleRouteApply);
 server.on("/baths_list", HTTP_GET, handleBathsList);
 server.on("/baths_update", HTTP_POST, handleBathsUpdate);
 server.on("/baths_learn", HTTP_POST, handleBathsLearn);
+server.on("/baths_add", HTTP_POST, handleBathAdd);
+server.on("/baths_delete", HTTP_POST, handleBathDelete);
 server.on("/baths_autolearn", HTTP_POST, handleBathsAutoLearn);
 server.on("/service_point_learn", HTTP_POST, handleServicePointLearn);
 server.on("/z_tag_learn", HTTP_POST, handleZTagLearn);
+server.on("/z_tag_delete", HTTP_POST, handleZTagDelete);
+server.on("/z_autolearn", HTTP_POST, handleZAutoLearn);
 
 // ============================
 //    *** UI ROUTES ***
@@ -2945,6 +3777,12 @@ server.on("/z_tag_learn", HTTP_POST, handleZTagLearn);
 server.on("/monitor", HTTP_GET, []() {
     DBG_PRINTLN(F("[HTTP] GET /monitor"));
     String page = renderPageMonitor();
+    server.send(200, "text/html", page);
+});
+
+server.on("/logs_ui", HTTP_GET, []() {
+    DBG_PRINTLN(F("[HTTP] GET /logs_ui"));
+    String page = renderPageLogs();
     server.send(200, "text/html", page);
 });
 
@@ -2977,6 +3815,9 @@ server.on("/baths_autolearn_ui", HTTP_GET, []() {
     xTaskCreatePinnedToCore(TaskProcess, "Process", 8192, nullptr, 2, nullptr, 1);
     xTaskCreatePinnedToCore(TaskUI,      "UI",      4096, nullptr, 1, nullptr, 1);
     xTaskCreatePinnedToCore(TaskWeb,     "Web",     4096, nullptr, 1, nullptr, 0);
+
+    DBG_PRINTLN(F("[SETUP] Tasks created, init PN532 after UI start"));
+    nfcInit();
 
     DBG_PRINTLN(F("===== GalvaControl setup done ====="));
 }

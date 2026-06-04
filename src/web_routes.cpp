@@ -552,6 +552,7 @@ String renderPageRoutes() {
     html.replace("{{nav_monitor}}", "");
     html.replace("{{nav_baths}}", "");
     html.replace("{{nav_autolearn}}", "");
+    html.replace("{{nav_logs}}", "");
 
     html.replace("{{content}}", FPSTR(WEB_ROUTES_CONTENT));
 

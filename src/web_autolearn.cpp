@@ -157,6 +157,7 @@ String renderPageAutoLearn() {
     html.replace("{{nav_monitor}}", "");
     html.replace("{{nav_routes}}", "");
     html.replace("{{nav_baths}}", "");
+    html.replace("{{nav_logs}}", "");
 
     html.replace("{{content}}", FPSTR(WEB_AUTLEARN_CONTENT));
 
