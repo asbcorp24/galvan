@@ -83,7 +83,7 @@
 #define PIN_ESTOP  26
 
 // Кнопка START (дубль веб-старта)
-#define BTN_START  39
+#define BTN_START  13
 
 // Энкодер
 #define ENC_A      34
@@ -1607,11 +1607,6 @@ int getEncDelta() {
 
 // Обработка кнопки START с антидребезгом
 bool startButtonPressed() {
-#if BTN_START == 39
-    // GPIO39 has no internal pull-up on ESP32, so this temporary remap
-    // causes floating false presses without an external resistor.
-    return false;
-#else
     static uint32_t last = 0;
     if (digitalRead(BTN_START) == LOW) {
         uint32_t now = millis();
@@ -1622,7 +1617,6 @@ bool startButtonPressed() {
         }
     }
     return false;
-#endif
 }
 
 // ---------------- ДВИЖЕНИЕ X — RFID версия ----------------
